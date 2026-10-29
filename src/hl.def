@@ -1,0 +1,7 @@
+LIBRARY hl
+EXPORTS
+	GiveFnptrsToDll @1
+	GetEntityAPI
+	GetEntityAPI2
+	GetNewDLLFunctions
+	Server_GetBlendingInterface

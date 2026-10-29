@@ -1,0 +1,19 @@
+# Build artifacts
+build/
+build-*/
+out/
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+!hl_randomizer/dlls/hl.dll
+!hl_randomizer/dlls/hl.so
+
+# Runtime generated Half-Life files if tested in-place
+hl_randomizer/chaos_stats.cfg
+hl_randomizer/deaths.txt
+hl_randomizer/SAVE/
+hl_randomizer/config.cfg
+hl_randomizer/custom.hpk

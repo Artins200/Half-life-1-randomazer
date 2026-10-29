@@ -1,0 +1,55 @@
+name: Build HL1 Randomizer Chaos Mod
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-windows-msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Win32 (MSVC)
+        run: cmake -B build-win32 -A Win32 -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Win32 hl.dll & Simulation Test
+        run: cmake --build build-win32 --config Release
+
+      - name: Run GoldSrc Chaos Simulation Test
+        run: .\build-win32\Release\test_chaos_simulation.exe
+
+      - name: Package Ready-to-Play Mod Folder
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package/hl_randomizer/dlls | Out-Null
+          Copy-Item hl_randomizer/liblist.gam package/hl_randomizer/
+          Copy-Item hl_randomizer/autoexec.cfg package/hl_randomizer/
+          Copy-Item hl_randomizer/chaos.cfg package/hl_randomizer/
+          Copy-Item hl_randomizer/commandmenu.txt package/hl_randomizer/
+          Copy-Item build-win32/Release/hl.dll package/hl_randomizer/dlls/hl.dll
+          Copy-Item hl_randomizer/dlls/hl.so package/hl_randomizer/dlls/hl.so
+          Compress-Archive -Path package/hl_randomizer -DestinationPath hl_randomizer_chaos_mod.zip -Force
+
+      - name: Upload Mod Zip Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hl_randomizer_chaos_mod
+          path: hl_randomizer_chaos_mod.zip
+
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure & Build Simulation Test
+        run: |
+          cmake -B build-linux -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-linux -j2
+
+      - name: Run Simulation & Binary ABI Verification
+        run: |
+          ./build-linux/test_chaos_simulation
+          python3 tests/test_pe_and_abi.py

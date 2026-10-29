@@ -1,0 +1,21 @@
+"1" "Random Event NOW! (Событие сейчас)" "chaos_now"
+"2" "Pause / Resume Chaos (Пауза)" "chaos_toggle"
+"3" "Interval (Интервал таймера)"
+{
+	"1" "5 sec (Безумие!)" "chaos_interval 5"
+	"2" "10 sec (Стандарт)" "chaos_interval 10"
+	"3" "15 sec (Комфорт)" "chaos_interval 15"
+	"4" "30 sec (Редко)" "chaos_interval 30"
+}
+"4" "Death Counter (Счётчик смертей)"
+{
+	"1" "Show Stats (Показать статистику)" "chaos_status"
+	"2" "Reset Deaths to 0 (Сбросить смерти)" "chaos_reset_deaths"
+}
+"5" "Sounds & Chat (Звук и чат)"
+{
+	"1" "Sounds ON" "chaos_sound 1"
+	"2" "Sounds OFF" "chaos_sound 0"
+	"3" "RU Chat ON" "chaos_ru_chat 1"
+	"4" "RU Chat OFF" "chaos_ru_chat 0"
+}
