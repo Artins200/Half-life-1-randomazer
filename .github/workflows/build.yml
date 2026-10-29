@@ -73,6 +73,19 @@ jobs:
             Write-Output "::error title=Win32 tests failed::$details"
             exit $code
           }
+      - name: Test the checked-in Win32 DLL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $output = @(& python tests/test_bridge_loader_win.py hl_randomizer/dlls/hl.dll build-win32/Release/hl_orig.dll build-win32/Release/test_win_loader.exe 2>&1)
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output "$_" }
+          if ($code -ne 0) {
+            $details = [string]::Join("`n", @($output | Select-Object -Last 60))
+            $details = $details.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Checked-in Win32 DLL failed::$details"
+            exit $code
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: windows-hl-dll
