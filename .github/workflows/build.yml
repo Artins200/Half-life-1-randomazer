@@ -41,9 +41,8 @@ jobs:
           name: linux-hl-so
           path: hl_randomizer/dlls/hl.so
 
-  build-windows-package:
+  test-and-build-windows:
     runs-on: windows-latest
-    needs: test-and-build-linux
     steps:
       - uses: actions/checkout@v4
       - name: Configure Win32 (MSVC)
@@ -74,14 +73,27 @@ jobs:
             Write-Output "::error title=Win32 tests failed::$details"
             exit $code
           }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-hl-dll
+          path: build-win32/Release/hl.dll
+
+  build-package:
+    runs-on: windows-latest
+    needs: [test-and-build-linux, test-and-build-windows]
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: linux-hl-so
           path: hl_randomizer/dlls
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-hl-dll
+          path: hl_randomizer/dlls
       - name: Assemble and verify the actual packaged libraries
         shell: pwsh
         run: |
-          Copy-Item build-win32/Release/hl.dll hl_randomizer/dlls/hl.dll -Force
           python tests/test_pe_and_abi.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Compress-Archive -Path hl_randomizer, README.md, LICENSE -DestinationPath hl_randomizer_chaos_mod.zip -Force

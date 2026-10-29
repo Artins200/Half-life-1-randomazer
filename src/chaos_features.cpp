@@ -226,11 +226,39 @@ void ChaosManager::UpdateCsAnimeMeme(edict_t *player) {
     if (++m_csAnimeFrame >= count) m_csAnimeFrame = -1;
 }
 
+static bool IsDirectory(const struct stat &info) {
+#ifdef _WIN32
+    return (info.st_mode & _S_IFMT) == _S_IFDIR;
+#else
+    return S_ISDIR(info.st_mode);
+#endif
+}
+
 ChaosSaveSlotResult ChaosFindUnusedSaveSlot(const char *gameDir, unsigned long timestamp,
                                            char *name, size_t nameSize) {
     if (!gameDir || !gameDir[0] || !name || nameSize == 0) return CHAOS_SAVE_SLOT_CHECK_FAILED;
     name[0] = '\0';
+    // Windows reports ENOENT for a file used as a parent directory. Validate
+    // both parents explicitly instead of treating that as a free save slot.
+    struct stat gameInfo;
+    if (stat(gameDir, &gameInfo) != 0 || !IsDirectory(gameInfo)) return CHAOS_SAVE_SLOT_CHECK_FAILED;
     const char *directories[] = {"SAVE", "save"};
+    for (const char *folder : directories) {
+        char path[400];
+        int len = snprintf(path, sizeof(path), "%s/%s", gameDir, folder);
+        if (len < 0 || (size_t)len >= sizeof(path)) return CHAOS_SAVE_SLOT_CHECK_FAILED;
+        struct stat info;
+        errno = 0;
+        if (stat(path, &info) == 0) {
+            if (!IsDirectory(info)) return CHAOS_SAVE_SLOT_CHECK_FAILED;
+        } else {
+            if (errno != ENOENT) return CHAOS_SAVE_SLOT_CHECK_FAILED;
+#ifndef _WIN32
+            // A dangling SAVE symlink is not an absent, safely creatable folder.
+            if (lstat(path, &info) == 0 || errno != ENOENT) return CHAOS_SAVE_SLOT_CHECK_FAILED;
+#endif
+        }
+    }
     const char *extensions[] = {"sav", "SAV"};
     // GoldSrc's SaveGameSlot can delete/age the <slot>01 backup, too.
     const char *suffixes[] = {"", "01"};

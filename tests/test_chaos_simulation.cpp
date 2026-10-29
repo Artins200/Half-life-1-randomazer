@@ -1105,6 +1105,19 @@ int main() {
     assert(ChaosFindUnusedSaveSlot(g_testGameDir, 42, tinySlot, sizeof(tinySlot)) == CHAOS_SAVE_SLOT_CHECK_FAILED);
     snprintf(badDir, sizeof(badDir), "%s/not_a_directory", g_testGameDir); WriteText(badDir, "file");
     assert(ChaosFindUnusedSaveSlot(badDir, 42, slot, sizeof(slot)) == CHAOS_SAVE_SLOT_CHECK_FAILED);
+    char badRoot[512], badSaveDir[520];
+    snprintf(badRoot, sizeof(badRoot), "%s/bad_save_root", g_testGameDir);
+    assert(MKDIR(badRoot) == 0);
+    snprintf(badSaveDir, sizeof(badSaveDir), "%s/SAVE", badRoot);
+    WriteText(badSaveDir, "not-a-directory");
+    assert(ChaosFindUnusedSaveSlot(badRoot, 42, slot, sizeof(slot)) == CHAOS_SAVE_SLOT_CHECK_FAILED);
+    assert(remove(badSaveDir) == 0);
+#ifndef _WIN32
+    assert(symlink("missing-directory", badSaveDir) == 0);
+    assert(ChaosFindUnusedSaveSlot(badRoot, 42, slot, sizeof(slot)) == CHAOS_SAVE_SLOT_CHECK_FAILED);
+    assert(remove(badSaveDir) == 0);
+#endif
+    assert(RMDIR(badRoot) == 0);
     snprintf(manualPath, sizeof(manualPath), "%s/SAVE/my_old_game.sav", g_testGameDir);
     WriteText(manualPath, "manual-save-sentinel");
     g_serverCommands.clear();
