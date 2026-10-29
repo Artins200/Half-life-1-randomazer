@@ -48,10 +48,32 @@ jobs:
       - uses: actions/checkout@v4
       - name: Configure Win32 (MSVC)
         run: cmake -B build-win32 -A Win32 -DCMAKE_BUILD_TYPE=Release
-      - name: Build and test Win32 DLL
+      - name: Build Win32 DLL
+        shell: pwsh
         run: |
-          cmake --build build-win32 --config Release
-          ctest --test-dir build-win32 -C Release --output-on-failure
+          $ErrorActionPreference = 'Continue'
+          $output = @(& cmake --build build-win32 --config Release 2>&1)
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output "$_" }
+          if ($code -ne 0) {
+            $details = [string]::Join("`n", @($output | Select-Object -Last 30))
+            $details = $details.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Win32 build failed::$details"
+            exit $code
+          }
+      - name: Test Win32 DLL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $output = @(& ctest --test-dir build-win32 -C Release --output-on-failure 2>&1)
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output "$_" }
+          if ($code -ne 0) {
+            $details = [string]::Join("`n", @($output | Select-Object -Last 60))
+            $details = $details.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Win32 tests failed::$details"
+            exit $code
+          }
       - uses: actions/download-artifact@v4
         with:
           name: linux-hl-so
