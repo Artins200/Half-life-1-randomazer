@@ -26,8 +26,34 @@ typedef void (*EntityFn)(entvars_t *);
 typedef int (*ProbeFn)();
 
 static int soundCalls = 0;
+static edict_t *activePlayer = nullptr;
+static int eventBanners = 0, countdowns = 0, oldSafeMode = 0, fixedVersionHud = 0;
 static int PrecacheSound(char *) { ++soundCalls; return 1; }
-static edict_t *EntityOfIndex(int) { return nullptr; }
+static edict_t *EntityOfIndex(int index) { return index == 1 ? activePlayer : nullptr; }
+static int RegisterUserMsg(const char *name, int) {
+    if (!strcmp(name, "SetFOV")) return 1;
+    if (!strcmp(name, "ScreenFade")) return 2;
+    if (!strcmp(name, "ScreenShake")) return 3;
+    return 4;
+}
+static float CVarGetFloat(const char *name) {
+    if (!strcmp(name, "chaos_enabled")) return 1;
+    if (!strcmp(name, "chaos_interval")) return 10;
+    return 0;
+}
+static void MessageBegin(int, int, const float *, edict_t *) {}
+static void MessageEnd() {}
+static void WriteInt(int) {}
+static void WriteCoord(float) {}
+static void WriteString(const char *s) {
+    if (!s) return;
+    if (strstr(s, ">>> RANDOM EVENT #")) ++eventBanners;
+    if (strstr(s, "NEXT:")) ++countdowns;
+    if (strstr(s, "STORY / VEHICLE SAFE MODE")) ++oldSafeMode;
+    if (strstr(s, "HL1 CHAOS v1.1")) ++fixedVersionHud;
+}
+static int CmdArgc() { return 2; }
+static const char *CmdArgv(int n) { return n == 0 ? "chaos_trigger" : "14"; }
 
 int main(int argc, char **argv) {
     assert(argc == 3);
@@ -48,7 +74,17 @@ int main(int argc, char **argv) {
     enginefuncs_t engine = {};
     engine.pfnPrecacheSound = PrecacheSound;
     engine.pfnPEntityOfEntIndex = EntityOfIndex;
-    const char pool[] = "\0worldspawn\0";
+    engine.pfnRegUserMsg = RegisterUserMsg;
+    engine.pfnCVarGetFloat = CVarGetFloat;
+    engine.pfnMessageBegin = MessageBegin;
+    engine.pfnMessageEnd = MessageEnd;
+    engine.pfnWriteByte = WriteInt;
+    engine.pfnWriteShort = WriteInt;
+    engine.pfnWriteCoord = WriteCoord;
+    engine.pfnWriteString = WriteString;
+    engine.pfnCmd_Argc = CmdArgc;
+    engine.pfnCmd_Argv = CmdArgv;
+    const char pool[] = "\0worldspawn\0c0a0\0c1a0\0";
     globalvars_t globals = {};
     globals.pStringBase = pool;
     give(&engine, &globals);
@@ -70,6 +106,58 @@ int main(int argc, char **argv) {
     assert(strcmp(dll.pfnGetGameDescription(), "HL1: Randomizer Chaos") == 0);
     worldspawn(&world.v);
     assert(world.v.health == 321.0f);
+
+    // Drive the actual loaded proxy through the intro and c1a0 without HEV.
+    // This catches a stale shipped binary that merely passes export checks.
+    assert(dll.pfnServerActivate && dll.pfnServerDeactivate && dll.pfnClientPutInServer &&
+           dll.pfnPlayerPreThink && dll.pfnStartFrame && dll.pfnPlayerPostThink && dll.pfnClientCommand);
+    edict_t player = {};
+    player.pvPrivateData = &player;
+    player.v.pContainingEntity = &player;
+    player.v.flags = FL_CLIENT | FL_ONTRAIN | FL_ONGROUND;
+    player.v.movetype = MOVETYPE_WALK;
+    player.v.health = 100;
+    player.v.maxspeed = 320;
+    player.v.deadflag = DEAD_NO;
+    activePlayer = &player;
+    globals.mapname = 12; // c0a0 in pool above
+    globals.time = 1;
+    globals.maxClients = 1;
+    globals.maxEntities = 128;
+    dll.pfnServerActivate(&world, 2, 1);
+    dll.pfnClientPutInServer(&player);
+    for (int i = 0; i < 130; ++i) {
+        globals.time += 0.2f;
+        dll.pfnPlayerPreThink(&player);
+        dll.pfnStartFrame();
+        dll.pfnPlayerPostThink(&player);
+    }
+    assert(eventBanners == 2 && countdowns > 0 && oldSafeMode == 0 && fixedVersionHud > 0);
+    dll.pfnServerDeactivate();
+
+    globals.mapname = 17; // c1a0
+    globals.time = 1;
+    player.v.flags = FL_CLIENT | FL_ONGROUND;
+    player.v.movetype = MOVETYPE_WALK;
+    player.v.health = 100;
+    player.v.weapons = 0; // no HEV
+    player.v.fov = 0;
+    player.v.maxspeed = 320;
+    eventBanners = countdowns = oldSafeMode = fixedVersionHud = 0;
+    dll.pfnServerActivate(&world, 2, 1);
+    dll.pfnClientPutInServer(&player);
+    for (int i = 0; i < 60; ++i) {
+        globals.time += 0.2f;
+        dll.pfnPlayerPreThink(&player);
+        dll.pfnStartFrame();
+        dll.pfnPlayerPostThink(&player);
+    }
+    assert(eventBanners == 1 && countdowns > 0 && oldSafeMode == 0 && fixedVersionHud > 0);
+    dll.pfnClientCommand(&player); // chaos_trigger 14: real speed effect before HEV
+    assert(eventBanners == 2 && player.v.maxspeed == 720);
+    dll.pfnServerDeactivate();
+    activePlayer = nullptr;
+
     char originalPath[1024];
     snprintf(originalPath, sizeof(originalPath), "%s", argv[1]);
     char *slash = strrchr(originalPath, '/');
@@ -94,7 +182,7 @@ int main(int argc, char **argv) {
     if (sizeof(void *) == 4) assert(roundtrip() == 1);
     CloseModule(original);
     CloseModule(proxy);
-    puts(sizeof(void *) == 4 ? "[OK] Shipped x86 proxy forwards, saves, and resolves original function names" :
-                              "[OK] Linux proxy loads and forwards to the fake original DLL");
+    puts(sizeof(void *) == 4 ? "[OK] Shipped x86 proxy forwards, saves, resolves names, and runs intro chaos" :
+                              "[OK] Proxy forwards to the fake original and runs intro chaos");
     return 0;
 }

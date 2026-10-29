@@ -65,7 +65,11 @@ private:
     bool IsClassReady(const char *classname) const;
     int ClassStringId(const char *classname);
     bool IsCueReady(const char *soundName) const;
+    bool IsChaosSessionAvailable(const edict_t *player) const;
+    bool IsRestrictedState(const edict_t *player) const;
+    bool SyncSafetyContext(edict_t *player);
     bool IsEventAllowed(const edict_t *player, int eventId) const;
+    bool IsEventAllowedInSession(const edict_t *player, int eventId) const;
     bool IsMovementSafe(const edict_t *player) const;
     int CountChaosEntities() const;
     bool HasEntityHeadroom() const;
@@ -160,6 +164,7 @@ private:
     int      m_edictCount;
     int      m_clientMax;
     bool     m_serverActive;
+    bool     m_restrictedContext;
 
     float m_flLastFrameTime;
     float m_flNextChaosTime;

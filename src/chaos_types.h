@@ -26,8 +26,8 @@ struct ChaosEventDef {
     ChaosCategory category;
     ChaosTone     tone;
     float         durationSec;   // 0.0f for instant events, >0.0f for timed effects
-    bool          requiresSuit;  // Only pick once player has HEV suit (protects c1a0 progression)
-    bool          skipOnTram;    // Skip on c0a0* intro tram ride
+    bool          requiresSuit;  // Inventory changes wait until the player has HEV.
+    bool          skipOnTram;    // During tram/cutscenes, pick only non-disruptive effects.
 };
 
 struct PlayerBreadcrumb {

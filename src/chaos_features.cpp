@@ -19,6 +19,7 @@ static bool SafePlayerContents(const Vec3 &origin, int hull) {
 }
 
 void ChaosManager::ResetTransientState() {
+    m_restrictedContext = false;
     m_totemArmed = false;
     ClearItemQueue();
     m_portalEnabled = false;
@@ -51,7 +52,7 @@ void ChaosManager::ActivateTotemIfNeeded(edict_t *player) {
 void ChaosManager::CmdTotem() {
     edict_t *player = FindActivePlayer();
     if (!IsEventAllowed(player, 38)) {
-        SendChatAndConsole(player, "[ХАОС] Тотем доступен после начала главы c1a1 и вне транспорта.\n");
+        SendChatAndConsole(player, "[ХАОС] Тотем доступен в одиночной игре вне транспорта и вступительного трамвая.\n");
         return;
     }
     m_totemArmed = true;
@@ -62,7 +63,7 @@ void ChaosManager::CmdTotem() {
 void ChaosManager::CmdPortalGun() {
     edict_t *player = FindActivePlayer();
     if (!IsEventAllowed(player, 39)) {
-        SendChatAndConsole(player, "[ХАОС] Портальное устройство доступно после главы c1a0 и вне транспорта.\n");
+        SendChatAndConsole(player, "[ХАОС] Порталы доступны в одиночной игре вне транспорта и вступительного трамвая.\n");
         return;
     }
     m_portalEnabled = true;

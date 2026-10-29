@@ -17,7 +17,14 @@ static int saveCalls = 0;
 static int namedThinkCalls = 0;
 
 FAKE_EXPORT void FAKE_GIVE_CALL GiveFnptrsToDll(enginefuncs_t *funcs, globalvars_t *) { engine = funcs; }
-static void FakeGameInit() { ++initCalls; }
+static void FakeGameInit() {
+    ++initCalls;
+    if (engine && engine->pfnRegUserMsg) {
+        engine->pfnRegUserMsg("SetFOV", 1);
+        engine->pfnRegUserMsg("ScreenFade", 10);
+        engine->pfnRegUserMsg("ScreenShake", 6);
+    }
+}
 static int FakeSpawn(edict_t *) {
     ++spawnCalls;
     if (engine && engine->pfnPrecacheSound) engine->pfnPrecacheSound((char *)"fvox/beep.wav");

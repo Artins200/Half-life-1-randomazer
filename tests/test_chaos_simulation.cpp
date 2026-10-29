@@ -751,19 +751,108 @@ int main() {
     dllTable.pfnClientCommand(&g_edicts[1]);
     assert(g_consoleOutput.size() <= 27 && Contains(g_consoleOutput, "476"));
 
-    printf("[3] Story, train, uncached-class and entity-budget guards...\n");
+    printf("[3] Chaos starts on the tram and before HEV; resource guards remain active...\n");
     Mock_CVarSetFloat("chaos_enabled", 1);
+    Mock_CVarSetFloat("chaos_interval", 10);
+    StartWorld(dllTable, "c0a0", 1, false);
+    g_edicts[1].v.flags |= FL_ONTRAIN;
+    g_allMessages.clear();
+    before = g_deathCounter.GetTotalEvents();
+    std::set<int> tramEvents;
+    for (int i = 0; i < 4; ++i) {
+        Step(dllTable, 10.4f);
+        assert(g_deathCounter.GetTotalEvents() == before + i + 1);
+        const ChaosEventDef *ev = g_chaos.GetEventDef(g_chaos.GetLastEventId());
+        assert(ev && !ev->requiresSuit && !ev->skipOnTram);
+        tramEvents.insert(ev->id);
+    }
+    assert(tramEvents.size() == 4); // The introductory pool is not a repeated placeholder.
+    bool tramHud = false;
+    for (const auto &m : g_allMessages) if (!m.strings.empty()) {
+        if (m.strings[0].find("NEXT:") != std::string::npos &&
+            m.strings[0].find("INTRO/VEHICLE: VISUAL EVENTS") != std::string::npos) tramHud = true;
+        assert(m.strings[0].find("STORY / VEHICLE SAFE MODE") == std::string::npos);
+    }
+    assert(tramHud && g_edicts[1].v.weapons == 0);
+    Mock_CVarSetFloat("chaos_enabled", 0);
+    before = g_deathCounter.GetTotalEvents();
+    g_chaos.CmdTriggerById(12); // physics stays blocked on a running tram
+    assert(g_deathCounter.GetTotalEvents() == before && Mock_CVarGetFloat("sv_gravity") == 800);
+    g_chaos.CmdTriggerById(33); // camera events actually stay active on the tram
+    assert(g_deathCounter.GetTotalEvents() == before + 1 && g_edicts[1].v.fov == 130);
+    Step(dllTable, 2); assert(g_edicts[1].v.fov == 130);
+    Step(dllTable, 9); assert(g_edicts[1].v.fov == 0);
+    g_allMessages.clear();
+    g_chaos.CmdTriggerById(428); Step(dllTable, 3);
+    bool lastAnimeFrame = false;
+    for (const auto &m : g_allMessages) if (!m.strings.empty() &&
+        m.strings[0].find("JUST A MEME!") != std::string::npos) lastAnimeFrame = true;
+    assert(lastAnimeFrame);
+
+    // Check the entire intro pool, including combinations: only effects that
+    // leave player movement, inventory and engine physics untouched run here.
+    StartWorld(dllTable, "c0a0", 1, false); g_edicts[1].v.flags |= FL_ONTRAIN;
+    g_receivedItems.clear(); g_serverCommands.clear();
+    int safeCount = 0;
+    for (int id = 0; id < g_chaos.GetEventCount(); ++id) {
+        const ChaosEventDef *ev = g_chaos.GetEventDef(id);
+        before = g_deathCounter.GetTotalEvents(); g_chaos.CmdTriggerById(id);
+        const bool allowed = !ev->requiresSuit && !ev->skipOnTram;
+        assert(g_deathCounter.GetTotalEvents() == before + (allowed ? 1 : 0));
+        if (allowed) ++safeCount;
+        Step(dllTable, 0.4f);
+        assert(g_edicts[1].v.health == 100 && g_edicts[1].v.weapons == 0 &&
+               g_edicts[1].v.velocity.Length() == 0 && g_edicts[1].v.maxspeed == 320);
+        assert(Mock_CVarGetFloat("sv_gravity") == 800 && Mock_CVarGetFloat("sv_maxspeed") == 320);
+        assert(g_receivedItems.empty() && g_serverCommands.empty() && CountSpawned() == 0);
+    }
+    assert(safeCount > CHAOS_HISTORY_SIZE);
+
+    Mock_CVarSetFloat("chaos_enabled", 1);
+    StartWorld(dllTable, "c0a0c", 1, false); // map prefix without FL_ONTRAIN
+    before = g_deathCounter.GetTotalEvents(); Step(dllTable, 11);
+    assert(g_deathCounter.GetTotalEvents() == before + 1);
+    assert(!g_chaos.GetEventDef(g_chaos.GetLastEventId())->skipOnTram);
+
     StartWorld(dllTable, "c1a0", 1, false);
     before = g_deathCounter.GetTotalEvents();
-    g_chaos.CmdTriggerById(23);
-    Step(dllTable, 35);
-    assert(g_deathCounter.GetTotalEvents() == before && g_edicts[1].v.weapons == 0);
-    bool safeHud = false;
-    for (const auto &m : g_allMessages) if (!m.strings.empty() && m.strings[0].find("STORY / VEHICLE SAFE MODE") != std::string::npos) safeHud = true;
-    assert(safeHud);
+    g_chaos.CmdTriggerById(14); // real physics effects work before the HEV suit
+    assert(g_deathCounter.GetTotalEvents() == before + 1 && g_edicts[1].v.maxspeed == 720);
+    g_chaos.CmdTriggerById(23); // but don't give/strip weapons before HEV
+    assert(g_deathCounter.GetTotalEvents() == before + 1 && g_edicts[1].v.weapons == 0);
+    Step(dllTable, 30.8f);
+    assert(g_deathCounter.GetTotalEvents() == before + 4);
+    assert(!g_chaos.GetEventDef(g_chaos.GetLastEventId())->requiresSuit);
     g_edicts[1].v.weapons |= (int)(1u << WEAPON_SUIT);
-    g_chaos.CmdTriggerById(14);
-    assert(g_deathCounter.GetTotalEvents() == before);
+    g_chaos.CmdTriggerById(23); // inventory events become available immediately
+    assert(g_deathCounter.GetTotalEvents() == before + 5);
+
+    // A time rewind (as on save-load) must restart the countdown, not freeze it.
+    StartWorld(dllTable, "c1a0a", 40, false);
+    before = g_deathCounter.GetTotalEvents(); Step(dllTable, 11);
+    assert(g_deathCounter.GetTotalEvents() == before + 1);
+    g_mockGlobals.time = 2; Step(dllTable, 11);
+    assert(g_deathCounter.GetTotalEvents() == before + 2);
+
+    // Empty network slots are not additional players. Joining a second client
+    // or enabling deathmatch/coop still suspends global physics changes.
+    StartWorld(dllTable, "c1a0", 1, false);
+    g_mockGlobals.maxClients = 2;
+    before = g_deathCounter.GetTotalEvents(); Step(dllTable, 21);
+    assert(g_deathCounter.GetTotalEvents() == before + 2);
+    g_edicts[2].v.flags |= FL_CLIENT; before = g_deathCounter.GetTotalEvents();
+    Step(dllTable, 15); assert(g_deathCounter.GetTotalEvents() == before);
+    g_edicts[2].v.flags &= ~FL_CLIENT; Step(dllTable, 11);
+    assert(g_deathCounter.GetTotalEvents() == before + 1);
+    g_mockGlobals.deathmatch = 1; before = g_deathCounter.GetTotalEvents();
+    Step(dllTable, 11); assert(g_deathCounter.GetTotalEvents() == before);
+    g_mockGlobals.deathmatch = 0; g_mockGlobals.coop = 1;
+    Step(dllTable, 11); assert(g_deathCounter.GetTotalEvents() == before);
+    g_mockGlobals.coop = 0;
+    StartWorld(dllTable, "c1a0", 1, false); g_mockGlobals.maxClients = 0;
+    before = g_deathCounter.GetTotalEvents(); Step(dllTable, 11);
+    assert(g_deathCounter.GetTotalEvents() == before + 1); // use ServerActivate's slot count
+
     StartWorld(dllTable, "c1a2", 1, true, false);
     Mock_CVarSetFloat("chaos_monsters", 1);
     before = g_deathCounter.GetTotalEvents();
@@ -912,11 +1001,11 @@ int main() {
     for (const auto &m : g_allMessages)
         for (const auto &s : m.strings) assert(s.find("JUST A MEME!") == std::string::npos);
     g_edicts[1].v.flags &= ~FL_ONTRAIN;
-    g_mockGlobals.maxClients = 2; g_serverCommands.clear();
+    g_mockGlobals.maxClients = 2; g_edicts[2].v.flags |= FL_CLIENT; g_serverCommands.clear();
     before = g_deathCounter.GetTotalEvents();
     g_chaos.CmdTriggerById(12); g_chaos.CmdC1A1(true);
     assert(g_deathCounter.GetTotalEvents() == before && g_serverCommands.empty());
-    g_mockGlobals.maxClients = 1;
+    g_edicts[2].v.flags &= ~FL_CLIENT; g_mockGlobals.maxClients = 1;
 
     printf("[5b] Overlapping movement effects do not shorten fall protection...\n");
     StartWorld(dllTable, "c1a2", 1, true);

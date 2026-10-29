@@ -124,6 +124,7 @@ ChaosManager::ChaosManager()
       m_edictCount(0),
       m_clientMax(1),
       m_serverActive(false),
+      m_restrictedContext(false),
       m_flLastFrameTime(0.0f),
       m_flNextChaosTime(10.0f),
       m_flNextHudRefresh(0.0f),
@@ -375,6 +376,7 @@ void ChaosManager::OnServerDeactivate() {
 void ChaosManager::OnClientPutInServer(edict_t *pPlayer) {
     g_deathCounter.OnClientPutInServer();
     ClearAllModifiers(pPlayer, true);
+    m_restrictedContext = false;
 
     float interval = ChaosInterval();
 
@@ -418,14 +420,54 @@ bool ChaosManager::IsMovementSafe(const edict_t *player) const {
     return player->v.movetype == MOVETYPE_WALK;
 }
 
-bool ChaosManager::IsEventAllowed(const edict_t *player, int eventId) const {
-    const ChaosEventDef *ev = ChaosGetEventDef(eventId);
-    if (!ev || !m_serverActive || !gpGlobals || !gpGlobals->pStringBase || gpGlobals->maxClients != 1 ||
+bool ChaosManager::IsChaosSessionAvailable(const edict_t *player) const {
+    if (!m_serverActive || !gpGlobals || !gpGlobals->pStringBase ||
         gpGlobals->deathmatch != 0.0f || gpGlobals->coop != 0.0f ||
-        !player || player->free || player->v.deadflag != DEAD_NO || player->v.health <= 0) return false;
-    const char *map = gpGlobals->mapname ? STRING(gpGlobals->mapname) : "";
-    // The tram and the whole pre-incident chapter contain fragile scripts.
-    if (!PlayerHasSuit(player) || !strncmp(map, "c0a0", 4) || !strncmp(map, "c1a0", 4) || !IsMovementSafe(player)) return false;
+        !player || player->free || !(player->v.flags & FL_CLIENT) ||
+        player->v.deadflag != DEAD_NO || player->v.health <= 0.0f) return false;
+
+    // maxClients is a slot capacity, not a player count. A local game with
+    // extra empty slots must not be stuck in safe mode. Still suspend effects
+    // if another client joins, or the engine reports an inconsistent limit.
+    int slots = gpGlobals->maxClients > 0 ? gpGlobals->maxClients : m_clientMax;
+    if (slots < 1 || slots > 64 || (gpGlobals->maxEntities > 0 && slots >= gpGlobals->maxEntities)) return false;
+    if (slots > 1) {
+        if (!g_engfuncs.pfnPEntityOfEntIndex) return false;
+        for (int i = 1; i <= slots; ++i) {
+            const edict_t *other = g_engfuncs.pfnPEntityOfEntIndex(i);
+            if (other && other != player && !other->free && (other->v.flags & FL_CLIENT)) return false;
+        }
+    }
+    return true;
+}
+
+bool ChaosManager::IsRestrictedState(const edict_t *player) const {
+    return IsIntroTramMap() || !IsMovementSafe(player);
+}
+
+bool ChaosManager::SyncSafetyContext(edict_t *player) {
+    if (!IsChaosSessionAvailable(player)) {
+        SuspendUnsafeEffects(player);
+        m_restrictedContext = false;
+        return false;
+    }
+    const bool restricted = IsRestrictedState(player);
+    // Cancel pre-existing movement, inventory and camera effects once upon
+    // entering a tram/cutscene. Newly selected visual events may then finish.
+    if (restricted && !m_restrictedContext) SuspendUnsafeEffects(player);
+    m_restrictedContext = restricted;
+    return true;
+}
+
+bool ChaosManager::IsEventAllowed(const edict_t *player, int eventId) const {
+    return IsChaosSessionAvailable(player) && IsEventAllowedInSession(player, eventId);
+}
+
+bool ChaosManager::IsEventAllowedInSession(const edict_t *player, int eventId) const {
+    const ChaosEventDef *ev = ChaosGetEventDef(eventId);
+    if (!ev) return false;
+    if ((ev->requiresSuit && !PlayerHasSuit(player)) ||
+        (ev->skipOnTram && IsRestrictedState(player))) return false;
     if (eventId < 12) {
         static const char *const classes[12] = {
             "monster_headcrab", "monster_babycrab", "monster_houndeye", "monster_bullchicken",
@@ -631,12 +673,15 @@ uint32_t static NextXorShift(uint32_t &state) {
 }
 
 int ChaosManager::PickNextEventId(const edict_t *pPlayer) {
+    if (!IsChaosSessionAvailable(pPlayer)) return -1;
     int candidates[CHAOS_EVENT_COUNT];
     int candidateCount = 0;
 
+    // The session/client count is stable for this synchronous selection; do
+    // not rescan every player slot once per catalog entry.
     for (int pass = 0; pass < 2 && candidateCount == 0; ++pass) {
         for (int i = 0; i < CHAOS_EVENT_COUNT; ++i) {
-            if (!IsEventAllowed(pPlayer, i)) continue;
+            if (!IsEventAllowedInSession(pPlayer, i)) continue;
 
             if (pass == 0) {
                 bool recentlyUsed = false;
@@ -1118,27 +1163,28 @@ void ChaosManager::RefreshStatusHud(edict_t *pPlayer) {
         snprintf(runLine, sizeof(runLine), "\nRUN: %02d:%02d.%d", whole / 60, whole % 60, (int)(elapsed * 10) % 10);
     }
     char hudBuf[384];
-    if (enabled && !IsEventAllowed(pPlayer, 12)) {
+    if (enabled && !IsChaosSessionAvailable(pPlayer)) {
         snprintf(hudBuf, sizeof(hudBuf),
-                 "=== HL1 CHAOS MOD ===\nDEATHS: %d  (MAP: %d)\nSTORY / VEHICLE SAFE MODE%s",
+                 "=== HL1 CHAOS v1.1 ===\nDEATHS: %d  (MAP: %d)\nWAITING FOR SINGLE PLAYER%s",
                  g_deathCounter.GetTotalDeaths(), g_deathCounter.GetMapDeaths(), runLine);
     } else if (enabled) {
         snprintf(hudBuf, sizeof(hudBuf),
-                 "=== HL1 CHAOS MOD ===\n"
+                 "=== HL1 CHAOS v1.1 ===\n"
                  "DEATHS: %d  (MAP: %d)\n"
                  "NEXT: %2ds [%s]\n"
-                 "LAST: %s%s%s%s",
+                 "LAST: %s%s%s%s%s",
                  g_deathCounter.GetTotalDeaths(),
                  g_deathCounter.GetMapDeaths(),
                  secLeft,
                  bar,
                  m_lastEventName,
+                 IsRestrictedState(pPlayer) ? "\nINTRO/VEHICLE: VISUAL EVENTS" : "",
                  (activeLine[0] != '\0') ? "\n" : "",
                  activeLine,
                  runLine);
     } else {
         snprintf(hudBuf, sizeof(hudBuf),
-                 "=== HL1 CHAOS [PAUSED] ===\n"
+                 "=== HL1 CHAOS v1.1 [PAUSED] ===\n"
                  "DEATHS: %d  (MAP: %d)\n"
                  "Type chaos_toggle to resume%s",
                  g_deathCounter.GetTotalDeaths(),
@@ -1836,23 +1882,23 @@ void ChaosManager::OnStartFrame() {
             ShowNewGameTroll(pPlayer);
     }
     UpdateCheckpoint(pPlayer);
-    const bool eventSafe = IsEventAllowed(pPlayer, 12);
-    if (eventSafe) {
-        UpdateItemQueue(pPlayer);
-        ActivateTotemIfNeeded(pPlayer);
-        UpdatePortalUse(pPlayer);
-        RecordBreadcrumb(pPlayer);
+    const bool sessionAvailable = SyncSafetyContext(pPlayer);
+    if (sessionAvailable) {
+        if (!m_restrictedContext) {
+            UpdateItemQueue(pPlayer);
+            ActivateTotemIfNeeded(pPlayer);
+            UpdatePortalUse(pPlayer);
+            RecordBreadcrumb(pPlayer);
+        }
+        // In a tram or cutscene, pre-existing disruptive effects were cleared
+        // on entry and only visual events can be selected. Their animations
+        // still need normal updates instead of being cancelled every frame.
         UpdateTimedModifiers(pPlayer);
         UpdateCsAnimeMeme(pPlayer);
-    } else {
-        SuspendUnsafeEffects(pPlayer);
     }
 
     const bool enabled = (!g_engfuncs.pfnCVarGetFloat || g_engfuncs.pfnCVarGetFloat("chaos_enabled") > 0.0f);
-    if (enabled && !eventSafe) {
-        m_flNextChaosTime = now + interval;
-        m_lastBeepSecond = -1;
-    } else if (enabled) {
+    if (enabled && sessionAvailable) {
         float rem = m_flNextChaosTime - now;
         int secLeft = (int)ceilf(rem);
         if (secLeft >= 1 && secLeft <= 3 && secLeft != m_lastBeepSecond) {
@@ -1868,6 +1914,7 @@ void ChaosManager::OnStartFrame() {
         }
     } else {
         m_flNextChaosTime = now + interval;
+        m_lastBeepSecond = -1;
     }
 
     if (now >= m_flNextHudRefresh) {
@@ -1943,12 +1990,11 @@ void ChaosManager::OnPlayerPreThink(edict_t *pPlayer) {
         ShowDeathBanner(pPlayer, g_deathCounter.GetTotalDeaths(), g_deathCounter.GetMapDeaths());
         return;
     }
-    if (!IsEventAllowed(pPlayer, 12)) {
-        SuspendUnsafeEffects(pPlayer);
-        return;
+    if (!SyncSafetyContext(pPlayer)) return;
+    if (!m_restrictedContext) {
+        ActivateTotemIfNeeded(pPlayer);
+        UpdateFallProtection(pPlayer);
     }
-    ActivateTotemIfNeeded(pPlayer);
-    UpdateFallProtection(pPlayer);
 }
 
 void ChaosManager::OnPlayerPostThink(edict_t *pPlayer) {
@@ -1960,11 +2006,8 @@ void ChaosManager::OnPlayerPostThink(edict_t *pPlayer) {
         return;
     }
     // The original PreThink can itself enter a train, ladder or scripted mode.
-    if (!IsEventAllowed(pPlayer, 12)) {
-        SuspendUnsafeEffects(pPlayer);
-        return;
-    }
-    ActivateTotemIfNeeded(pPlayer);
+    if (!SyncSafetyContext(pPlayer)) return;
+    if (!m_restrictedContext) ActivateTotemIfNeeded(pPlayer);
     if (m_flFovEnd > 0.0f && gpGlobals && gpGlobals->time < m_flFovEnd) {
         pPlayer->v.fov = (float)m_iTargetFov;
     }
@@ -2018,6 +2061,10 @@ void ChaosManager::CmdTriggerRandom() {
     edict_t *pPlayer = FindActivePlayer();
     if (!pPlayer || pPlayer->v.deadflag != DEAD_NO || pPlayer->v.health <= 0.0f) return;
     if (gpGlobals && gpGlobals->time < m_nextManualEventTime) return;
+    if (!SyncSafetyContext(pPlayer)) {
+        SendChatAndConsole(pPlayer, "[ХАОС] События доступны в одиночной игре.\n");
+        return;
+    }
 
     float interval = ChaosInterval();
     if (gpGlobals) m_flNextChaosTime = gpGlobals->time + interval;
@@ -2043,8 +2090,12 @@ void ChaosManager::CmdTriggerById(int eventId) {
         return;
     }
 
+    if (!SyncSafetyContext(pPlayer)) {
+        SendChatAndConsole(pPlayer, "[ХАОС] События доступны в одиночной игре.\n");
+        return;
+    }
     if (!IsEventAllowed(pPlayer, eventId)) {
-        SendChatAndConsole(pPlayer, "[ХАОС] Событие заблокировано для безопасности: сюжет, транспорт или ресурсы.\n");
+        SendChatAndConsole(pPlayer, "[ХАОС] Это событие недоступно: транспорт, HEV или ресурсы. Другие события продолжаются.\n");
         return;
     }
     if (gpGlobals && gpGlobals->time < m_nextManualEventTime) return;
@@ -2132,10 +2183,19 @@ void ChaosManager::CmdPrintStatus(edict_t *pPlayer) {
     if (!pPlayer) pPlayer = FindActivePlayer();
     char buf[256];
     snprintf(buf, sizeof(buf),
-             "[ХАОС СТАТИСТИКА] Смертей всего: %d | На этой карте: %d | Пережито событий: %d | До след. события: %.1f сек\n",
+             "[ХАОС v1.1] Смертей всего: %d | На этой карте: %d | Пережито событий: %d | До след. события: %.1f сек\n",
              g_deathCounter.GetTotalDeaths(),
              g_deathCounter.GetMapDeaths(),
              g_deathCounter.GetTotalEvents(),
              GetTimeRemaining());
     SendChatAndConsole(pPlayer, buf);
+    const bool enabled = !g_engfuncs.pfnCVarGetFloat || g_engfuncs.pfnCVarGetFloat("chaos_enabled") > 0.0f;
+    if (!enabled)
+        SendChatAndConsole(pPlayer, "[ХАОС] Автособытия на паузе: chaos_enabled 1 или chaos_toggle.\n");
+    else if (!IsChaosSessionAvailable(pPlayer))
+        SendChatAndConsole(pPlayer, "[ХАОС] Ожидание живого игрока в одиночной игре.\n");
+    else if (IsRestrictedState(pPlayer))
+        SendChatAndConsole(pPlayer, "[ХАОС] События работают: во вступлении и транспорте доступны визуальные эффекты.\n");
+    else
+        SendChatAndConsole(pPlayer, "[ХАОС] Автособытия работают; ограничения действуют только для отдельных событий.\n");
 }
