@@ -3,8 +3,8 @@
 Binary verification for Half-Life 1 Randomizer Chaos Mod:
 1. Validates hl_randomizer/dlls/hl.dll (Win32 PE32 i386):
    - Machine == IMAGE_FILE_MACHINE_I386 (0x014c), Magic == PE32 (0x010b)
-   - Exports exact unmangled symbols: GiveFnptrsToDll (@1), GetEntityAPI, GetEntityAPI2,
-     GetNewDLLFunctions, Server_GetBlendingInterface
+   - Exports the five unmangled GoldSrc entry points plus all 250 entity wrappers
+   - Every export points to executable code within this PE image
    - Export names are strictly sorted lexicographically (required for Win32 GetProcAddress binary search)
    - GiveFnptrsToDll uses __stdcall (contains 'ret 8' -> 0xC2 0x08 0x00)
    - Zero non-system MinGW DLL dependencies (no libgcc, libstdc++, libwinpthread)
@@ -14,8 +14,14 @@ Binary verification for Half-Life 1 Randomizer Chaos Mod:
 """
 
 import os
+import re
 import struct
-import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+ENTITY_NAMES = re.findall(r"HL_ENTITY_LINK\((\w+)\)",
+                          (ROOT / "src/hl_entity_list.inc").read_text(encoding="utf-8"))
+assert len(ENTITY_NAMES) == 250 and len(set(ENTITY_NAMES)) == 250
 
 
 def verify_win32_pe(dll_path: str) -> None:
@@ -41,10 +47,11 @@ def verify_win32_pe(dll_path: str) -> None:
     sec_off = opt_off + opt_size
     for i in range(num_sec):
         name, vsize, vrva, rsize, roff = struct.unpack_from("<8sIIII", data, sec_off + i * 40)
-        secs.append((name.rstrip(b"\x00").decode(errors="replace"), vrva, vsize, roff, rsize))
+        flags = struct.unpack_from("<I", data, sec_off + i * 40 + 36)[0]
+        secs.append((name.rstrip(b"\x00").decode(errors="replace"), vrva, vsize, roff, rsize, flags))
 
     def rva2off(rva: int) -> int:
-        for _, vrva, vsize, roff, rsize in secs:
+        for _, vrva, vsize, roff, rsize, _ in secs:
             if vrva <= rva < vrva + max(vsize, rsize):
                 return roff + (rva - vrva)
         raise AssertionError(f"Unmapped RVA 0x{rva:x}")
@@ -79,8 +86,13 @@ def verify_win32_pe(dll_path: str) -> None:
         "GetNewDLLFunctions",
         "Server_GetBlendingInterface",
     ]
-    for req in required:
+    for req in required + ENTITY_NAMES:
         assert req in exports, f"Missing required GoldSrc export '{req}' in {dll_path}"
+    for name in required + ENTITY_NAMES:
+        _, fn_rva = exports[name]
+        assert any(vrva <= fn_rva < vrva + max(vsize, rsize) and (flags & 0x20000000)
+                   for _, vrva, vsize, _, rsize, flags in secs), (
+            f"{name} must be a real executable export inside the PE, not a fabricated RVA")
 
     give_ord, give_rva = exports["GiveFnptrsToDll"]
     assert give_ord == 1, f"GiveFnptrsToDll should have ordinal 1, got {give_ord}"
@@ -124,8 +136,27 @@ def verify_linux_elf(so_path: str) -> None:
     assert e_type == 3, f"Expected ET_DYN shared object (3), got {e_type}"
     assert e_machine == 3, f"Expected EM_386 i386 (3), got {e_machine}"
 
-    for sym in (b"GiveFnptrsToDll\x00", b"GetEntityAPI2\x00", b"worldspawn\x00", b"monster_headcrab\x00", b"weapon_shotgun\x00"):
-        assert sym in data, f"Missing expected symbol {sym!r} in {so_path}"
+    # Inspect actual defined dynamic symbols, not arbitrary strings in the file.
+    shoff = struct.unpack_from("<I", data, 32)[0]
+    shentsize, shnum = struct.unpack_from("<HH", data, 46)
+    assert shoff and shentsize >= 40 and shnum, "Missing ELF section headers"
+    sections = [struct.unpack_from("<IIIIIIIIII", data, shoff + i * shentsize) for i in range(shnum)]
+    exports = set()
+    for sec in sections:
+        if sec[1] != 11:  # SHT_DYNSYM
+            continue
+        _, _, _, _, symoff, symsize, link, _, _, entsize = sec
+        assert 0 <= link < len(sections) and entsize >= 16
+        strsec = sections[link]
+        strings = data[strsec[4] : strsec[4] + strsec[5]]
+        for off in range(symoff, symoff + symsize, entsize):
+            nameoff, value, _, info, visibility, shndx = struct.unpack_from("<IIIBBH", data, off)
+            if not nameoff or not value or not shndx or info >> 4 != 1 or (visibility & 3) != 0:
+                continue
+            end = strings.index(b"\x00", nameoff)
+            exports.add(strings[nameoff:end].decode("ascii"))
+    for sym in ["GiveFnptrsToDll", "GetEntityAPI", "GetEntityAPI2"] + ENTITY_NAMES:
+        assert sym in exports, f"Missing defined exported function '{sym}' in {so_path}"
 
     print(f"[OK] {so_path}: Valid 32-bit i386 ELF shared library ({len(data)} bytes)")
 

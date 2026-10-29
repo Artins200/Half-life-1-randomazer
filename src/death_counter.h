@@ -17,6 +17,8 @@ public:
 
     void IncrementEvents();
     void ResetDeaths();
+    void FlushIfDue(float now);
+    void FlushNow();
 
     int GetTotalDeaths() const   { return m_totalDeaths; }
     int GetSessionDeaths() const { return m_sessionDeaths; }
@@ -24,7 +26,7 @@ public:
     int GetTotalEvents() const   { return m_totalEvents; }
     const char *GetCurrentMap() const { return m_currentMap; }
 
-    void SaveToDisk() const;
+    void SaveToDisk();
     void LoadFromDisk();
 
 private:
@@ -36,6 +38,8 @@ private:
     int  m_totalEvents;
 
     bool m_initialized;
+    bool m_dirty;
+    float m_nextFlushTime;
     bool m_playerSpawnedAlive;
     bool m_deathCountedThisLife;
 

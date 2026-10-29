@@ -688,7 +688,7 @@ typedef struct {
 #define IN_MOVERIGHT        (1 << 10)
 
 #define WEAPON_SUIT         31
-#define SF_NORESPAWN        (1 << 10)
+#define SF_NORESPAWN        (1 << 30) // Valve cbase.h: never respawn an item
 
 // Compile-time x86 GoldSrc ABI layout checks
 #if INTPTR_MAX == INT32_MAX
@@ -702,6 +702,25 @@ static_assert(sizeof(KeyValueData) == 16, "KeyValueData size mismatch");
 static_assert(sizeof(cvar_t) == 20, "cvar_t size mismatch");
 static_assert(sizeof(enginefuncs_t) == 636, "enginefuncs_t size mismatch");
 static_assert(offsetof(enginefuncs_t, pfnCheckParm) == 628, "enginefuncs_t::pfnCheckParm offset mismatch");
+// Cross-checked against the 32-bit Valve HL SDK headers, not just sizeof.
+static_assert(offsetof(globalvars_t, maxClients) == 144, "globalvars_t::maxClients offset mismatch");
+static_assert(offsetof(globalvars_t, pStringBase) == 152, "globalvars_t::pStringBase offset mismatch");
+static_assert(offsetof(entvars_t, velocity) == 32, "entvars_t::velocity offset mismatch");
+static_assert(offsetof(entvars_t, health) == 352, "entvars_t::health offset mismatch");
+static_assert(offsetof(entvars_t, weapons) == 360, "entvars_t::weapons offset mismatch");
+static_assert(offsetof(entvars_t, flags) == 420, "entvars_t::flags offset mismatch");
+static_assert(offsetof(entvars_t, maxspeed) == 528, "entvars_t::maxspeed offset mismatch");
+static_assert(offsetof(entvars_t, flFallVelocity) == 564, "entvars_t::flFallVelocity offset mismatch");
+static_assert(offsetof(entvars_t, iuser4) == 592, "entvars_t::iuser4 offset mismatch");
+static_assert(offsetof(enginefuncs_t, pfnCreateNamedEntity) == 92, "engine entity callback offset mismatch");
+static_assert(offsetof(enginefuncs_t, pfnTraceHull) == 136, "engine trace callback offset mismatch");
+static_assert(offsetof(enginefuncs_t, pfnMessageBegin) == 184, "engine message callback offset mismatch");
+static_assert(offsetof(enginefuncs_t, pfnFunctionFromName) == 312, "engine save callback offset mismatch");
+static_assert(offsetof(enginefuncs_t, pfnNumberOfEntities) == 420, "engine edict callback offset mismatch");
+static_assert(offsetof(enginefuncs_t, pfnAddServerCommand) == 560, "engine command callback offset mismatch");
+static_assert(offsetof(DLL_FUNCTIONS, pfnClientCommand) == 76, "DLL client command offset mismatch");
+static_assert(offsetof(DLL_FUNCTIONS, pfnStartFrame) == 100, "DLL frame callback offset mismatch");
+
 static_assert(sizeof(DLL_FUNCTIONS) == 200, "DLL_FUNCTIONS size mismatch");
 static_assert(sizeof(NEW_DLL_FUNCTIONS) == 20, "NEW_DLL_FUNCTIONS size mismatch");
 #endif

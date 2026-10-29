@@ -2,6 +2,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <limits.h>
+#include <errno.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 DeathCounter g_deathCounter;
 
@@ -11,6 +17,8 @@ DeathCounter::DeathCounter()
       m_mapDeaths(0),
       m_totalEvents(0),
       m_initialized(false),
+      m_dirty(false),
+      m_nextFlushTime(0.0f),
       m_playerSpawnedAlive(false),
       m_deathCountedThisLife(false) {
     m_currentMap[0] = '\0';
@@ -70,9 +78,9 @@ void DeathCounter::OnClientPutInServer() {
 void DeathCounter::OnClientKill() {
     if (m_playerSpawnedAlive && !m_deathCountedThisLife) {
         m_deathCountedThisLife = true;
-        m_totalDeaths++;
-        m_sessionDeaths++;
-        m_mapDeaths++;
+        if (m_totalDeaths < INT_MAX) ++m_totalDeaths;
+        if (m_sessionDeaths < INT_MAX) ++m_sessionDeaths;
+        if (m_mapDeaths < INT_MAX) ++m_mapDeaths;
         SaveToDisk();
     }
 }
@@ -94,9 +102,9 @@ bool DeathCounter::CheckPlayerState(const edict_t *pPlayer) {
 
     if (!m_deathCountedThisLife && !isAlive) {
         m_deathCountedThisLife = true;
-        m_totalDeaths++;
-        m_sessionDeaths++;
-        m_mapDeaths++;
+        if (m_totalDeaths < INT_MAX) ++m_totalDeaths;
+        if (m_sessionDeaths < INT_MAX) ++m_sessionDeaths;
+        if (m_mapDeaths < INT_MAX) ++m_mapDeaths;
         SaveToDisk();
         return true;
     }
@@ -110,9 +118,18 @@ bool DeathCounter::CheckPlayerState(const edict_t *pPlayer) {
 }
 
 void DeathCounter::IncrementEvents() {
-    m_totalEvents++;
-    SaveToDisk();
+    if (m_totalEvents < INT_MAX) ++m_totalEvents;
+    m_dirty = true;
 }
+void DeathCounter::FlushIfDue(float now) {
+    if (!m_dirty) return;
+    if (m_nextFlushTime <= 0.0f || now < m_nextFlushTime - 30.0f) m_nextFlushTime = now + 15.0f;
+    else if (now >= m_nextFlushTime) {
+        SaveToDisk();
+        if (m_dirty) m_nextFlushTime = now + 30.0f; // retry failed writes, not every frame
+    }
+}
+void DeathCounter::FlushNow() { if (m_dirty) SaveToDisk(); }
 
 void DeathCounter::ResetDeaths() {
     m_totalDeaths = 0;
@@ -121,27 +138,40 @@ void DeathCounter::ResetDeaths() {
     SaveToDisk();
 }
 
-void DeathCounter::SaveToDisk() const {
+static bool ReplaceFileAtomically(const char *temporary, const char *destination) {
+#ifdef _WIN32
+    return MoveFileExA(temporary, destination, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    return rename(temporary, destination) == 0;
+#endif
+}
+void DeathCounter::SaveToDisk() {
     char dir[260];
     ResolveDataDir(dir, sizeof(dir));
-
-    char statsPath[320];
+    char statsPath[320], statsTmp[340], txtPath[320], txtTmp[340];
     snprintf(statsPath, sizeof(statsPath), "%s/chaos_stats.cfg", dir);
-    FILE *fp = fopen(statsPath, "wb");
-    if (fp) {
-        fprintf(fp, "// Half-Life 1 Randomizer Chaos Persistent Stats\n");
-        fprintf(fp, "total_deaths=%d\n", m_totalDeaths);
-        fprintf(fp, "total_events=%d\n", m_totalEvents);
-        fclose(fp);
-    }
-
-    char txtPath[320];
+    snprintf(statsTmp, sizeof(statsTmp), "%s.tmp", statsPath);
     snprintf(txtPath, sizeof(txtPath), "%s/deaths.txt", dir);
-    FILE *ft = fopen(txtPath, "wb");
-    if (ft) {
-        fprintf(ft, "Deaths: %d\n", m_totalDeaths);
-        fclose(ft);
+    snprintf(txtTmp, sizeof(txtTmp), "%s.tmp", txtPath);
+
+    bool statsSaved = false;
+    FILE *fp = fopen(statsTmp, "wb");
+    if (fp) {
+        bool wrote = fprintf(fp, "// Half-Life 1 Randomizer Chaos Persistent Stats\ntotal_deaths=%d\ntotal_events=%d\n",
+                             m_totalDeaths, m_totalEvents) >= 0;
+        bool closed = fclose(fp) == 0;
+        if (wrote && closed) statsSaved = ReplaceFileAtomically(statsTmp, statsPath);
     }
+    if (!statsSaved && fp) remove(statsTmp);
+
+    FILE *ft = fopen(txtTmp, "wb");
+    if (ft) {
+        bool wrote = fprintf(ft, "Deaths: %d\n", m_totalDeaths) >= 0;
+        bool closed = fclose(ft) == 0;
+        if (!(wrote && closed && ReplaceFileAtomically(txtTmp, txtPath))) remove(txtTmp);
+    }
+    m_dirty = !statsSaved;
+    if (statsSaved) m_nextFlushTime = 0.0f;
 }
 
 void DeathCounter::LoadFromDisk() {
@@ -157,12 +187,17 @@ void DeathCounter::LoadFromDisk() {
 
     char line[128];
     while (fgets(line, sizeof(line), fp)) {
-        int val = 0;
-        if (sscanf(line, "total_deaths=%d", &val) == 1 && val >= 0) {
-            m_totalDeaths = val;
-        } else if (sscanf(line, "total_events=%d", &val) == 1 && val >= 0) {
-            m_totalEvents = val;
-        }
+        const char *value = nullptr;
+        bool isDeath = false;
+        if (strncmp(line, "total_deaths=", 13) == 0) { value = line + 13; isDeath = true; }
+        else if (strncmp(line, "total_events=", 13) == 0) value = line + 13;
+        if (!value) continue;
+        errno = 0;
+        char *end = nullptr;
+        long parsed = strtol(value, &end, 10);
+        if (errno == ERANGE || end == value || parsed < 0 || parsed > INT_MAX) continue;
+        if (isDeath) m_totalDeaths = (int)parsed;
+        else m_totalEvents = (int)parsed;
     }
     fclose(fp);
 }

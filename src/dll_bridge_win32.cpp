@@ -16,7 +16,7 @@ typedef int  (__cdecl   *PFN_SERVER_GETBLENDING)(int, void **, void *, float *, 
 
 static HMODULE g_hSelfModule = nullptr;
 static HMODULE g_hGameModule = nullptr;
-static bool    g_bExportsMerged = false;
+static bool    g_loadAttempted = false;
 
 static PFN_GIVEFNPTRSTODLL    g_pfnOrigGiveFnptrs = nullptr;
 static PFN_GETENTITYAPI       g_pfnOrigGetEntityAPI = nullptr;
@@ -25,7 +25,6 @@ static PFN_GETNEWDLLFUNCTIONS g_pfnOrigGetNewDLLFunctions = nullptr;
 static PFN_SERVER_GETBLENDING g_pfnOrigServerGetBlending = nullptr;
 
 #define RVA_TO_VA(base, rva) ((uintptr_t)(base) + (uintptr_t)(rva))
-#define VA_TO_RVA(base, va)  ((uint32_t)((uintptr_t)(va) - (uintptr_t)(base)))
 
 static IMAGE_EXPORT_DIRECTORY *GetModuleExportDir(HMODULE mod) {
     if (!mod) return nullptr;
@@ -42,119 +41,6 @@ static IMAGE_EXPORT_DIRECTORY *GetModuleExportDir(HMODULE mod) {
     IMAGE_EXPORT_DIRECTORY *expDir = (IMAGE_EXPORT_DIRECTORY *)RVA_TO_VA(mod, expRva);
     if (IsBadReadPtr(expDir, sizeof(*expDir))) return nullptr;
     return expDir;
-}
-
-struct ExportNameEntry {
-    uintptr_t nameVa;
-    uint16_t  ordinalIndex;
-};
-
-static int CompareExportNames(const void *a, const void *b) {
-    const ExportNameEntry *ea = (const ExportNameEntry *)a;
-    const ExportNameEntry *eb = (const ExportNameEntry *)b;
-    return strcmp((const char *)ea->nameVa, (const char *)eb->nameVa);
-}
-
-static bool MergeGameDllExports(HMODULE hSelf, HMODULE hGame) {
-    if (g_bExportsMerged) return true;
-
-    IMAGE_EXPORT_DIRECTORY *expSelf = GetModuleExportDir(hSelf);
-    IMAGE_EXPORT_DIRECTORY *expGame = GetModuleExportDir(hGame);
-    if (!expSelf || !expGame) {
-        return false;
-    }
-
-    const DWORD totalFuncs = expSelf->NumberOfFunctions + expGame->NumberOfFunctions;
-    const DWORD maxNames   = expSelf->NumberOfNames + expGame->NumberOfNames;
-
-    uintptr_t *funcVas = (uintptr_t *)calloc(totalFuncs, sizeof(uintptr_t));
-    ExportNameEntry *entries = (ExportNameEntry *)calloc(maxNames, sizeof(ExportNameEntry));
-    if (!funcVas || !entries) {
-        free(funcVas);
-        free(entries);
-        return false;
-    }
-
-    const DWORD *selfFuncs = (const DWORD *)RVA_TO_VA(hSelf, expSelf->AddressOfFunctions);
-    const DWORD *selfNames = (const DWORD *)RVA_TO_VA(hSelf, expSelf->AddressOfNames);
-    const WORD  *selfOrds  = (const WORD  *)RVA_TO_VA(hSelf, expSelf->AddressOfNameOrdinals);
-
-    for (DWORD i = 0; i < expSelf->NumberOfFunctions; ++i) {
-        funcVas[i] = RVA_TO_VA(hSelf, selfFuncs[i]);
-    }
-    DWORD nameCount = 0;
-    for (DWORD i = 0; i < expSelf->NumberOfNames; ++i) {
-        entries[nameCount].nameVa = RVA_TO_VA(hSelf, selfNames[i]);
-        entries[nameCount].ordinalIndex = selfOrds[i];
-        nameCount++;
-    }
-
-    const DWORD selfFuncCount = expSelf->NumberOfFunctions;
-    const DWORD selfNameCount = nameCount;
-
-    const DWORD *gameFuncs = (const DWORD *)RVA_TO_VA(hGame, expGame->AddressOfFunctions);
-    const DWORD *gameNames = (const DWORD *)RVA_TO_VA(hGame, expGame->AddressOfNames);
-    const WORD  *gameOrds  = (const WORD  *)RVA_TO_VA(hGame, expGame->AddressOfNameOrdinals);
-
-    for (DWORD i = 0; i < expGame->NumberOfFunctions; ++i) {
-        funcVas[selfFuncCount + i] = RVA_TO_VA(hGame, gameFuncs[i]);
-    }
-
-    for (DWORD i = 0; i < expGame->NumberOfNames; ++i) {
-        const char *gName = (const char *)RVA_TO_VA(hGame, gameNames[i]);
-        bool alreadyExported = false;
-        for (DWORD s = 0; s < selfNameCount; ++s) {
-            if (_stricmp(gName, (const char *)entries[s].nameVa) == 0) {
-                alreadyExported = true;
-                break;
-            }
-        }
-        if (alreadyExported) {
-            continue;
-        }
-        entries[nameCount].nameVa = (uintptr_t)gName;
-        entries[nameCount].ordinalIndex = (uint16_t)(selfFuncCount + gameOrds[i]);
-        nameCount++;
-    }
-
-    qsort(entries, nameCount, sizeof(ExportNameEntry), CompareExportNames);
-
-    DWORD *newFuncRvas = (DWORD *)VirtualAlloc(nullptr, totalFuncs * sizeof(DWORD), MEM_COMMIT, PAGE_READWRITE);
-    DWORD *newNameRvas = (DWORD *)VirtualAlloc(nullptr, nameCount * sizeof(DWORD), MEM_COMMIT, PAGE_READWRITE);
-    WORD  *newOrdinals = (WORD  *)VirtualAlloc(nullptr, nameCount * sizeof(WORD),  MEM_COMMIT, PAGE_READWRITE);
-
-    if (!newFuncRvas || !newNameRvas || !newOrdinals) {
-        free(funcVas);
-        free(entries);
-        return false;
-    }
-
-    for (DWORD i = 0; i < totalFuncs; ++i) {
-        newFuncRvas[i] = VA_TO_RVA(hSelf, funcVas[i]);
-    }
-    for (DWORD i = 0; i < nameCount; ++i) {
-        newNameRvas[i] = VA_TO_RVA(hSelf, entries[i].nameVa);
-        newOrdinals[i] = entries[i].ordinalIndex;
-    }
-
-    free(funcVas);
-    free(entries);
-
-    DWORD oldProtect = 0;
-    if (!VirtualProtect(expSelf, sizeof(*expSelf), PAGE_READWRITE, &oldProtect)) {
-        return false;
-    }
-
-    expSelf->Base                  = 1;
-    expSelf->NumberOfFunctions     = totalFuncs;
-    expSelf->NumberOfNames         = nameCount;
-    expSelf->AddressOfFunctions    = VA_TO_RVA(hSelf, newFuncRvas);
-    expSelf->AddressOfNames        = VA_TO_RVA(hSelf, newNameRvas);
-    expSelf->AddressOfNameOrdinals = VA_TO_RVA(hSelf, newOrdinals);
-
-    VirtualProtect(expSelf, sizeof(*expSelf), oldProtect, &oldProtect);
-    g_bExportsMerged = true;
-    return true;
 }
 
 static bool IsSameFilePath(const char *pathA, const char *pathB) {
@@ -179,9 +65,9 @@ static void StripLastPathComponent(char *path) {
 }
 
 bool Bridge_LoadOriginalGameDll() {
-    if (g_hGameModule != nullptr) {
-        return true;
-    }
+    if (g_hGameModule != nullptr) return true;
+    if (g_loadAttempted) return false;
+    g_loadAttempted = true;
 
     char selfPath[MAX_PATH] = {0};
     if (!GetModuleFileNameA(g_hSelfModule, selfPath, MAX_PATH)) {
@@ -230,15 +116,21 @@ bool Bridge_LoadOriginalGameDll() {
         return false;
     }
 
-    // Grab original entry points BEFORE merging export tables
+    // Resolve original entry points; our export table remains untouched.
     g_pfnOrigGiveFnptrs        = (PFN_GIVEFNPTRSTODLL)GetProcAddress(g_hGameModule, "GiveFnptrsToDll");
     g_pfnOrigGetEntityAPI      = (PFN_GETENTITYAPI)GetProcAddress(g_hGameModule, "GetEntityAPI");
     g_pfnOrigGetEntityAPI2     = (PFN_GETENTITYAPI2)GetProcAddress(g_hGameModule, "GetEntityAPI2");
     g_pfnOrigGetNewDLLFunctions = (PFN_GETNEWDLLFUNCTIONS)GetProcAddress(g_hGameModule, "GetNewDLLFunctions");
     g_pfnOrigServerGetBlending = (PFN_SERVER_GETBLENDING)GetProcAddress(g_hGameModule, "Server_GetBlendingInterface");
 
-    MergeGameDllExports(g_hSelfModule, g_hGameModule);
-    return (g_pfnOrigGiveFnptrs != nullptr);
+    if (!g_pfnOrigGiveFnptrs || (!g_pfnOrigGetEntityAPI && !g_pfnOrigGetEntityAPI2)) {
+        MessageBoxA(nullptr, "The original Half-Life game DLL has incompatible exports.",
+                    "HL1 Randomizer Chaos Error", MB_OK | MB_ICONERROR);
+        FreeLibrary(g_hGameModule);
+        g_hGameModule = nullptr;
+        return false;
+    }
+    return true;
 }
 
 bool Bridge_IsLoaded() {
@@ -255,12 +147,19 @@ int Bridge_ForwardGetEntityAPI(DLL_FUNCTIONS *pFunctionTable, int interfaceVersi
     if (g_pfnOrigGetEntityAPI) {
         return g_pfnOrigGetEntityAPI(pFunctionTable, interfaceVersion);
     }
+    if (g_pfnOrigGetEntityAPI2) {
+        int version = interfaceVersion;
+        return g_pfnOrigGetEntityAPI2(pFunctionTable, &version);
+    }
     return FALSE;
 }
 
 int Bridge_ForwardGetEntityAPI2(DLL_FUNCTIONS *pFunctionTable, int *interfaceVersion) {
     if (g_pfnOrigGetEntityAPI2) {
         return g_pfnOrigGetEntityAPI2(pFunctionTable, interfaceVersion);
+    }
+    if (g_pfnOrigGetEntityAPI && interfaceVersion) {
+        return g_pfnOrigGetEntityAPI(pFunctionTable, *interfaceVersion);
     }
     return FALSE;
 }
@@ -291,6 +190,14 @@ const char *Bridge_ResolveNameForFunction(uint32_t functionAddr) {
     if (!g_hGameModule || functionAddr == 0) {
         return nullptr;
     }
+    // Save/restore and SetThink repeatedly ask for the same functions.
+    // A bounded direct-mapped cache avoids scanning the PE export list each time.
+    struct NameCacheEntry { uint32_t address; const char *name; };
+    static NameCacheEntry cache[256] = {};
+    NameCacheEntry &slot = cache[(functionAddr >> 4) % 256];
+    if (slot.address == functionAddr) return slot.name;
+    slot.address = functionAddr;
+    slot.name = nullptr;
     IMAGE_EXPORT_DIRECTORY *expGame = GetModuleExportDir(g_hGameModule);
     if (!expGame) {
         return nullptr;
@@ -305,24 +212,36 @@ const char *Bridge_ResolveNameForFunction(uint32_t functionAddr) {
         if (ord < expGame->NumberOfFunctions) {
             uint32_t va = (uint32_t)RVA_TO_VA(g_hGameModule, gameFuncs[ord]);
             if (va == functionAddr) {
-                return (const char *)RVA_TO_VA(g_hGameModule, gameNames[i]);
+                slot.name = (const char *)RVA_TO_VA(g_hGameModule, gameNames[i]);
+                return slot.name;
             }
         }
     }
     return nullptr;
 }
 
+// Static, real PE exports: never patch the Windows loader's export table or
+// fabricate RVAs outside the image. GoldSrc can resolve these normally.
+typedef void (__cdecl *PFN_ENTITY_FN)(entvars_t *);
+#define HL_ENTITY_LINK(entityName) \
+    extern "C" void __cdecl entityName(entvars_t *pev) { \
+        static PFN_ENTITY_FN fn = nullptr; \
+        if (!fn && Bridge_LoadOriginalGameDll()) \
+            fn = (PFN_ENTITY_FN)GetProcAddress(g_hGameModule, #entityName); \
+        if (fn) fn(pev); \
+    }
+#include "hl_entity_list.inc"
+#undef HL_ENTITY_LINK
+
 extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     (void)lpvReserved;
     if (fdwReason == DLL_PROCESS_ATTACH) {
         g_hSelfModule = hinstDLL;
         DisableThreadLibraryCalls(hinstDLL);
-    } else if (fdwReason == DLL_PROCESS_DETACH) {
-        if (g_hGameModule) {
-            FreeLibrary(g_hGameModule);
-            g_hGameModule = nullptr;
-        }
     }
+    // Do not call FreeLibrary from DllMain: the loader lock is held here and
+    // unloading another game DLL can deadlock or crash during shutdown. The
+    // OS releases the original module on process exit.
     return TRUE;
 }
 

@@ -4,6 +4,7 @@
 #include "death_counter.h"
 
 #include <string.h>
+#include <stdio.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -21,25 +22,25 @@ DLL_FUNCTIONS g_origDllFuncs;
 qboolean      g_bHasOrigDllFuncs = FALSE;
 
 static enginefuncs_t g_hookedEngfuncs;
+#ifdef CHAOS_STANDALONE_SIMULATION
+extern "C" const enginefuncs_t *ChaosTestHookedEngine() { return &g_hookedEngfuncs; }
+#endif
 
 // ============================================================================
 // Engine callback hooks passed to original valve/dlls/hl.dll
 // ============================================================================
 
-static int Hook_PrecacheModel(char *s) {
-    g_chaos.OnTrackPrecacheModel(s);
-    if (g_engfuncs.pfnPrecacheModel) {
-        return g_engfuncs.pfnPrecacheModel(s);
-    }
-    return 0;
+static int Hook_PrecacheSound(char *s) {
+    if (!g_engfuncs.pfnPrecacheSound) return 0;
+    int result = g_engfuncs.pfnPrecacheSound(s);
+    if (result > 0) g_chaos.OnTrackPrecacheSound(s);
+    return result;
 }
 
-static int Hook_PrecacheSound(char *s) {
-    g_chaos.OnTrackPrecacheSound(s);
-    if (g_engfuncs.pfnPrecacheSound) {
-        return g_engfuncs.pfnPrecacheSound(s);
-    }
-    return 0;
+static edict_t *Hook_CreateNamedEntity(int classname) {
+    edict_t *entity = g_engfuncs.pfnCreateNamedEntity ? g_engfuncs.pfnCreateNamedEntity(classname) : nullptr;
+    g_chaos.OnWorldEntityCreated(classname, entity);
+    return entity;
 }
 
 static int Hook_RegUserMsg(const char *pszName, int iSize) {
@@ -86,21 +87,26 @@ static void Hook_GameInit(void) {
 }
 
 static int Hook_Spawn(edict_t *pent) {
-    bool isWorld = false;
-    if (pent && gpGlobals && gpGlobals->pStringBase && pent->v.classname) {
-        const char *cls = STRING(pent->v.classname);
-        if (cls && strcmp(cls, "worldspawn") == 0) {
-            isWorld = true;
-            g_chaos.OnMapPrecacheReset();
-        }
-    }
-
-    int result = g_origDllFuncs.pfnSpawn ? g_origDllFuncs.pfnSpawn(pent) : 0;
-
+    char classname[64] = {0};
+    if (pent && gpGlobals && gpGlobals->pStringBase && pent->v.classname)
+        snprintf(classname, sizeof(classname), "%s", STRING(pent->v.classname));
+    const bool isWorld = strcmp(classname, "worldspawn") == 0;
     if (isWorld) {
-        g_chaos.OnWorldSpawnPost();
+        g_chaos.OnMapPrecacheReset();
+        g_chaos.OnWorldPrecacheBegin();
     }
+    int result = g_origDllFuncs.pfnSpawn ? g_origDllFuncs.pfnSpawn(pent) : -1;
+    if (isWorld) g_chaos.OnWorldPrecacheEnd();
+    else g_chaos.OnMapEntitySpawned(classname, pent, result);
     return result;
+}
+
+static void Hook_Save(edict_t *entity, SAVERESTOREDATA *data) {
+    if (!g_origDllFuncs.pfnSave) return;
+    ChaosManager::PlayerSaveSnapshot snapshot;
+    bool restore = g_chaos.BeforePlayerSave(entity, snapshot);
+    g_origDllFuncs.pfnSave(entity, data);
+    if (restore) g_chaos.AfterPlayerSave(entity, snapshot);
 }
 
 static void Hook_ServerActivate(edict_t *pEdictList, int edictCount, int clientMax) {
@@ -172,6 +178,7 @@ static void InstallDllHooks(DLL_FUNCTIONS *pFunctionTable) {
 
     pFunctionTable->pfnGameInit           = Hook_GameInit;
     pFunctionTable->pfnSpawn              = Hook_Spawn;
+    pFunctionTable->pfnSave               = Hook_Save;
     pFunctionTable->pfnServerActivate     = Hook_ServerActivate;
     pFunctionTable->pfnServerDeactivate   = Hook_ServerDeactivate;
     pFunctionTable->pfnClientPutInServer  = Hook_ClientPutInServer;
@@ -190,26 +197,16 @@ static void InstallDllHooks(DLL_FUNCTIONS *pFunctionTable) {
 HL_GIVEFNPTRS GiveFnptrsToDll(enginefuncs_t *pengfuncsFromEngine, globalvars_t *pGlobals) {
     memset(&g_engfuncs, 0, sizeof(g_engfuncs));
     if (pengfuncsFromEngine) {
-#ifdef _WIN32
-        void **dst = (void **)&g_engfuncs;
-        void *const *src = (void *const *)pengfuncsFromEngine;
-        const size_t count = sizeof(enginefuncs_t) / sizeof(void *);
-        for (size_t i = 0; i < count; ++i) {
-            if (!IsBadReadPtr(&src[i], sizeof(void *))) {
-                dst[i] = src[i];
-            } else {
-                break;
-            }
-        }
-#else
+        // Copy only the legacy prefix; newer engines may append callbacks.
+        // Reading past an older table (even with IsBadReadPtr) is undefined.
         const size_t safeLegacySize = offsetof(enginefuncs_t, pfnPEntityOfEntIndexAllEntities);
         memcpy(&g_engfuncs, pengfuncsFromEngine, safeLegacySize);
-#endif
+        g_engfuncs.pfnPEntityOfEntIndexAllEntities = g_engfuncs.pfnPEntityOfEntIndex;
     }
     gpGlobals = pGlobals;
 
     memcpy(&g_hookedEngfuncs, &g_engfuncs, sizeof(enginefuncs_t));
-    g_hookedEngfuncs.pfnPrecacheModel    = Hook_PrecacheModel;
+    g_hookedEngfuncs.pfnCreateNamedEntity = Hook_CreateNamedEntity;
     g_hookedEngfuncs.pfnPrecacheSound    = Hook_PrecacheSound;
     g_hookedEngfuncs.pfnRegUserMsg       = Hook_RegUserMsg;
     g_hookedEngfuncs.pfnFunctionFromName = Hook_FunctionFromName;
