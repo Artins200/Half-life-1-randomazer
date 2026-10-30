@@ -4,18 +4,18 @@
 
 static const ChaosEventDef g_baseEventDefs[CHAOS_BASE_EVENT_COUNT] = {
     // === MONSTERS & NPCS (0..11) ===
-    {  0, "HEADCRAB AMBUSH!",        "Засада хедкрабов!",         "Вокруг может появиться до 3 хедкрабов!",              CHAOS_CAT_MONSTERS, CHAOS_TONE_DANGER,   0.0f, false, true },
-    {  1, "BABY CRAB SWARM!",        "Рой мини-хедкрабов!",       "До трёх быстрых детёнышей хедкраба!",        CHAOS_CAT_MONSTERS, CHAOS_TONE_DANGER,   0.0f, false, true },
-    {  2, "HOUNDEYE SONIC PACK!",    "Стая хаундаев!",            "Два звуковых пса Xen готовят ультразвуковую волну!", CHAOS_CAT_MONSTERS, CHAOS_TONE_DANGER,   0.0f, false, true },
-    {  3, "BULLSQUID SURPRISE!",     "Кислотный буллсквид!",      "Рядом телепортировался голодный буллсквид!",         CHAOS_CAT_MONSTERS, CHAOS_TONE_DANGER,   0.0f, false, true },
-    {  4, "ZOMBIE OUTBREAK!",        "Нашествие зомби!",          "Два зомбированных учёных вышли на охоту!",           CHAOS_CAT_MONSTERS, CHAOS_TONE_DANGER,   0.0f, false, true },
-    {  5, "XEN VORTIGAUNT RAID!",    "Вторжение вортигонта!",     "Портал из Xen перенёс боевого вортигонта!",          CHAOS_CAT_MONSTERS, CHAOS_TONE_DANGER,   0.0f, false, true },
+    {  0, "HEADCRAB AMBUSH!",        "Засада хедкрабов!",         "Вокруг может появиться до 3 хедкрабов!",              CHAOS_CAT_MONSTERS, CHAOS_TONE_DANGER,   0.0f, true, true },
+    {  1, "BABY CRAB SWARM!",        "Рой мини-хедкрабов!",       "До трёх быстрых детёнышей хедкраба!",        CHAOS_CAT_MONSTERS, CHAOS_TONE_DANGER,   0.0f, true, true },
+    {  2, "HOUNDEYE SONIC PACK!",    "Стая хаундаев!",            "Два звуковых пса Xen готовят ультразвуковую волну!", CHAOS_CAT_MONSTERS, CHAOS_TONE_DANGER,   0.0f, true, true },
+    {  3, "BULLSQUID SURPRISE!",     "Кислотный буллсквид!",      "Рядом телепортировался голодный буллсквид!",         CHAOS_CAT_MONSTERS, CHAOS_TONE_DANGER,   0.0f, true, true },
+    {  4, "ZOMBIE OUTBREAK!",        "Нашествие зомби!",          "Два зомбированных учёных вышли на охоту!",           CHAOS_CAT_MONSTERS, CHAOS_TONE_DANGER,   0.0f, true, true },
+    {  5, "XEN VORTIGAUNT RAID!",    "Вторжение вортигонта!",     "Портал из Xen перенёс боевого вортигонта!",          CHAOS_CAT_MONSTERS, CHAOS_TONE_DANGER,   0.0f, true, true },
     {  6, "HECU MARINE DROP!",       "Десант спецназа HECU!",     "Пехотинец HECU высадился прямо поблизости!",         CHAOS_CAT_MONSTERS, CHAOS_TONE_DANGER,   0.0f, true, true },
     {  7, "ALIEN GRUNT HORNETS!",    "Пехотинец пришельцев!",     "Мощный Alien Grunt с мухомётом вышел из портала!",   CHAOS_CAT_MONSTERS, CHAOS_TONE_DANGER,   0.0f, true, true },
-    {  8, "SNARK PARTY!",            "Вечеринка снарков!",        "До трёх кусачих снарков бегут грызть всех!",      CHAOS_CAT_MONSTERS, CHAOS_TONE_DANGER,   0.0f, false, true },
-    {  9, "ROACH INFESTATION!",      "Нашествие тараканов!",      "До трёх шуршащих тараканов Чёрной Мезы!",             CHAOS_CAT_MONSTERS, CHAOS_TONE_WEIRD,    0.0f, false, true },
-    { 10, "BARNEY REINFORCEMENT!",   "Подмога от Барни!",         "Дружелюбный охранник Барни пришёл прикрыть спину!",  CHAOS_CAT_MONSTERS, CHAOS_TONE_GOOD,     0.0f, false, true },
-    { 11, "PANICKED SCIENTISTS!",    "Паника научного отдела!",   "Трое учёных появились рядом в полной панике!",       CHAOS_CAT_MONSTERS, CHAOS_TONE_WEIRD,    0.0f, false, true },
+    {  8, "SNARK PARTY!",            "Вечеринка снарков!",        "До трёх кусачих снарков бегут грызть всех!",      CHAOS_CAT_MONSTERS, CHAOS_TONE_DANGER,   0.0f, true, true },
+    {  9, "ROACH INFESTATION!",      "Нашествие тараканов!",      "До трёх шуршащих тараканов Чёрной Мезы!",             CHAOS_CAT_MONSTERS, CHAOS_TONE_WEIRD,    0.0f, true, true },
+    { 10, "BARNEY REINFORCEMENT!",   "Подмога от Барни!",         "Дружелюбный охранник Барни пришёл прикрыть спину!",  CHAOS_CAT_MONSTERS, CHAOS_TONE_GOOD,     0.0f, true, true },
+    { 11, "PANICKED SCIENTISTS!",    "Паника научного отдела!",   "Трое учёных появились рядом в полной панике!",       CHAOS_CAT_MONSTERS, CHAOS_TONE_WEIRD,    0.0f, true, true },
 
     // === PHYSICS & MOVEMENT (12..21) ===
     { 12, "MOON GRAVITY (10S)",      "Лунная гравитация!",        "Притяжение снижено в 5 раз на 10 секунд!",           CHAOS_CAT_PHYSICS,  CHAOS_TONE_NEUTRAL, 10.0f, false, true },
@@ -30,7 +30,7 @@ static const ChaosEventDef g_baseEventDefs[CHAOS_BASE_EVENT_COUNT] = {
     { 21, "BLINK DASH FORWARD!",     "Телепорт-рывок вперёд!",    "Мгновенный блинк вперёд по направлению взгляда!",    CHAOS_CAT_PHYSICS,  CHAOS_TONE_NEUTRAL,  0.0f, false, true },
 
     // === WEAPONS & INVENTORY (22..27) ===
-    { 22, "RANDOM WEAPON GIFT!",     "Случайная пушка!",          "Выдано случайное мощное оружие с боезапасом!",       CHAOS_CAT_WEAPONS,  CHAOS_TONE_GOOD,     0.0f, true, true },
+    { 22, "RANDOM WEAPON GIFT!",     "Случайная пушка!",          "Выдаётся случайное доступное оружие HL1 и патроны!",  CHAOS_CAT_WEAPONS,  CHAOS_TONE_GOOD,     0.0f, true, true },
     { 23, "FULL ARSENAL JACKPOT!",   "ДЖЕКПОТ: Полный арсенал!",  "Выданы все пушки и запас патронов!",                 CHAOS_CAT_WEAPONS,  CHAOS_TONE_GOOD,     0.0f, true, true },
     { 24, "CROWBAR ONLY!",           "Только монтировка!",        "Пушки отобраны — в руках только верная монтировка!", CHAOS_CAT_WEAPONS,  CHAOS_TONE_DANGER,   0.0f, true, true },
     { 25, "DEMOMAN LOADOUT!",        "Набор подрывника!",         "Только взрывчатка: RPG, гранаты, ранцы и мины!",     CHAOS_CAT_WEAPONS,  CHAOS_TONE_WEIRD,    0.0f, true, true },
@@ -59,7 +59,7 @@ static const ChaosEventDef g_specialDefs[CHAOS_SPECIAL_EVENT_COUNT] = {
     {39, "APERTURE PORTAL DEVICE", "Портальное устройство", "Две точки и безопасный переход между ними на одной карте.", CHAOS_CAT_PHYSICS, CHAOS_TONE_GOOD, 0, false, true},
     {40, "SPEEDRUN STRAT", "Спидран-страта", "Короткое ускорение и прыжок — без изменения времени игры.", CHAOS_CAT_PHYSICS, CHAOS_TONE_GOOD, 8, false, true},
     {41, "NEW GAME? JUST KIDDING!", "Новая игра? Троллинг!", "Фальшивый экран перезапуска: настоящие сохранения не трогаем.", CHAOS_CAT_VISUAL, CHAOS_TONE_WEIRD, 0, false, false},
-    {42, "OPFOR INSPIRED LOADOUT", "Набор в духе Opposing Force", "Выдаёт доступное штатное оружие HL1, без файлов Gearbox.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true},
+    {42, "OPFOR / HL LOADOUT", "Набор Opposing Force / HL1", "Одно случайное оружие OF, если подготовлено; иначе аналоги HL1.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true},
     {43, "CREEPER? AW MAN!", "Крипер? О нет!", "Трёхсекундная несмертельная аномальная волна.", CHAOS_CAT_VISUAL, CHAOS_TONE_DANGER, 3, false, true}
 };
 
@@ -68,6 +68,36 @@ static const ChaosEventDef g_extraDefs[CHAOS_EXTRA_EVENT_COUNT] = {
     {CHAOS_RECIPE_END, "CS 1.6 ANIME UPDATE?!", "Аниме-обновление CS 1.6?!",
      "Короткая шуточная анимация в HUD, без установки сторонних моделей.",
      CHAOS_CAT_VISUAL, CHAOS_TONE_WEIRD, 3, false, false}
+};
+
+// Standalone pickups, not cosmetic effect combinations. Only classes that
+// the active original game/map already precached may be instantiated.
+static const ChaosWeaponGiftDef g_weaponGifts[CHAOS_WEAPON_GIFT_COUNT] = {
+    {{477, "CROWBAR DELIVERY", "Доставка монтировки", "Штатная монтировка HL1.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_crowbar", nullptr, nullptr},
+    {{478, "GLOCK DELIVERY", "Доставка Glock", "Пистолет и патроны 9 мм.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_9mmhandgun", "ammo_9mmclip", "ammo_9mmclip"},
+    {{479, "PYTHON DELIVERY", "Доставка Python", "Револьвер и патроны .357.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_357", "ammo_357", "ammo_357"},
+    {{480, "SHOTGUN DELIVERY", "Доставка дробовика", "Дробовик и картечь.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_shotgun", "ammo_buckshot", "ammo_buckshot"},
+    {{481, "MP5 DELIVERY", "Доставка MP5", "Автомат, патроны и гранаты для подствольника.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_9mmAR", "ammo_9mmAR", "ammo_ARgrenades"},
+    {{482, "CROSSBOW DELIVERY", "Доставка арбалета", "Арбалет и болты.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_crossbow", "ammo_crossbow", "ammo_crossbow"},
+    {{483, "RPG DELIVERY", "Доставка RPG", "Ракетница и ракеты.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_rpg", "ammo_rpgclip", "ammo_rpgclip"},
+    {{484, "GAUSS DELIVERY", "Доставка гаусс-пушки", "Гаусс-пушка и энергетические батареи.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_gauss", "ammo_gaussclip", "ammo_gaussclip"},
+    {{485, "EGON DELIVERY", "Доставка глюонной пушки", "Глюонная пушка и энергетические батареи.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_egon", "ammo_gaussclip", "ammo_gaussclip"},
+    {{486, "HORNET GUN DELIVERY", "Доставка мухомёта", "Штатный мухомёт HL1.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_hornetgun", nullptr, nullptr},
+    {{487, "GRENADES DELIVERY", "Доставка гранат", "Ручные гранаты HL1.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_handgrenade", nullptr, nullptr},
+    {{488, "SATCHEL DELIVERY", "Доставка взрывпакета", "Ранцевый заряд HL1.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_satchel", nullptr, nullptr},
+    {{489, "TRIPMINE DELIVERY", "Доставка растяжки", "Лазерная мина HL1.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_tripmine", nullptr, nullptr},
+    {{490, "SNARK WEAPON DELIVERY", "Доставка снарков", "Оружие со снарками HL1.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_snark", nullptr, nullptr},
+    // These names are genuine Gearbox classes, not Valve weapon reskins. They
+    // are eligible only when the active original DLL/map prepared the class.
+    {{491, "OPFOR PIPE WRENCH", "OF: трубный ключ", "Оригинальный ключ Opposing Force.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_pipewrench", nullptr, nullptr},
+    {{492, "OPFOR KNIFE", "OF: нож", "Оригинальный нож Opposing Force.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_knife", nullptr, nullptr},
+    {{493, "OPFOR GRAPPLE", "OF: язык-кошка", "Оригинальный Barnacle Grapple.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_grapple", nullptr, nullptr},
+    {{494, "OPFOR DESERT EAGLE", "OF: Desert Eagle", "Desert Eagle и доступные патроны .357.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_eagle", "ammo_357", "ammo_357"},
+    {{495, "OPFOR M249", "OF: M249", "M249 и доступные патроны 5.56.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_m249", "ammo_556", "ammo_556"},
+    {{496, "OPFOR SNIPER RIFLE", "OF: снайперская винтовка", "Винтовка M40A1 и доступные патроны 7.62.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_sniperrifle", "ammo_762", "ammo_762"},
+    {{497, "OPFOR SPORE LAUNCHER", "OF: споромёт", "Оригинальный споромёт и доступные споры.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_sporelauncher", "ammo_spore", "ammo_spore"},
+    {{498, "OPFOR SHOCK RIFLE", "OF: шоковая винтовка", "Оригинальное оружие Shock Roach.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_shockrifle", nullptr, nullptr},
+    {{499, "OPFOR DISPLACER", "OF: дезинтегратор", "Displacer и доступные энергетические батареи.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_displacer", "ammo_gaussclip", "ammo_gaussclip"}
 };
 
 struct Theme {
@@ -101,7 +131,7 @@ static const Theme g_themes[CHAOS_THEME_COUNT] = {
     {"MEDIC",          "Медик",               "Регенерация здоровья", CHAOS_CAT_SURVIVAL, CHAOS_TONE_GOOD},
     {"APERTURE BLUE",  "Синий портал",        "Пытается установить синюю точку на стене перед игроком", CHAOS_CAT_PHYSICS, CHAOS_TONE_GOOD},
     {"APERTURE ORANGE","Оранжевый портал",   "Пытается установить оранжевую точку на стене перед игроком", CHAOS_CAT_PHYSICS, CHAOS_TONE_GOOD},
-    {"OPFOR KIT",      "Набор Opposing Force", "Выдаёт доступные аналоги оружия HL1", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD}
+    {"OPFOR KIT",      "Набор Opposing Force", "Подготовленное оружие OF или аналоги HL1", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD}
 };
 
 struct Variant { const char *en; const char *ru; };
@@ -179,20 +209,34 @@ const ChaosEventDef *ChaosGetEventDef(int id) {
         return &g_recipes[id - CHAOS_RECIPE_START];
     }
     if (id < CHAOS_EXTENSION_START) return &g_extraDefs[id - CHAOS_RECIPE_END];
-    InitRecipes();
-    return &g_extraRecipes[id - CHAOS_EXTENSION_START];
+    if (id < CHAOS_EXTENSION_END) {
+        InitRecipes();
+        return &g_extraRecipes[id - CHAOS_EXTENSION_START];
+    }
+    return &g_weaponGifts[id - CHAOS_WEAPON_GIFT_START].event;
+}
+const ChaosWeaponGiftDef *ChaosGetWeaponGift(int id) {
+    if (id < CHAOS_WEAPON_GIFT_START || id >= CHAOS_EVENT_COUNT) return nullptr;
+    return &g_weaponGifts[id - CHAOS_WEAPON_GIFT_START];
 }
 int ChaosRecipeTheme(int id) {
     if (id >= CHAOS_RECIPE_START && id < CHAOS_RECIPE_END)
         return (id - CHAOS_RECIPE_START) / CHAOS_VARIANT_COUNT;
-    if (id >= CHAOS_EXTENSION_START && id < CHAOS_EVENT_COUNT)
+    if (id >= CHAOS_EXTENSION_START && id < CHAOS_EXTENSION_END)
         return (id - CHAOS_EXTENSION_START) / CHAOS_EXTRA_VARIANT_COUNT;
     return -1;
 }
 int ChaosRecipeVariant(int id) {
     if (id >= CHAOS_RECIPE_START && id < CHAOS_RECIPE_END)
         return (id - CHAOS_RECIPE_START) % CHAOS_VARIANT_COUNT;
-    if (id >= CHAOS_EXTENSION_START && id < CHAOS_EVENT_COUNT)
+    if (id >= CHAOS_EXTENSION_START && id < CHAOS_EXTENSION_END)
         return CHAOS_VARIANT_COUNT + (id - CHAOS_EXTENSION_START) % CHAOS_EXTRA_VARIANT_COUNT;
     return -1;
+}
+bool ChaosRecipeAllowedAutomatically(int id, bool restricted) {
+    const int theme = ChaosRecipeTheme(id);
+    const int variant = ChaosRecipeVariant(id);
+    if (restricted || theme < 0 || variant < 0) return false;
+    // Both of these overwrite the AWP theme's FOV immediately.
+    return !(theme == 15 && (variant == 8 || variant == 9));
 }

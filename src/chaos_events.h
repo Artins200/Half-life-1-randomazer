@@ -11,7 +11,7 @@ public:
     ChaosManager();
 
     void RegisterCvarsAndCommands();
-    void OnRegUserMsg(const char *pszName, int iMsgId);
+    void OnRegUserMsg(const char *pszName, int iMsgId, int size);
     void OnMapPrecacheReset();
     void OnWorldPrecacheBegin();
     void OnWorldPrecacheEnd();
@@ -21,11 +21,16 @@ public:
     void OnServerActivate(edict_t *pEdictList, int edictCount, int clientMax);
     void OnServerDeactivate();
     void OnClientPutInServer(edict_t *pPlayer);
+    void OnClientDisconnect(edict_t *pPlayer);
     bool OnClientCommand(edict_t *pPlayer);
 
     void OnStartFrame();
     void OnPlayerPreThink(edict_t *pPlayer);
     void OnPlayerPostThink(edict_t *pPlayer);
+
+    struct MovementOverride { bool speed, clientModified; float maxspeed, clientmaxspeed; };
+    void BeforePlayerMove(struct playermove_s *move, qboolean server, MovementOverride &state);
+    void AfterPlayerMove(struct playermove_s *move, const MovementOverride &state);
 
     // Serialize the player's pre-effect values, while keeping the live effect
     // active after the engine finishes writing the save.
@@ -70,11 +75,13 @@ private:
     bool SyncSafetyContext(edict_t *player);
     bool IsEventAllowed(const edict_t *player, int eventId) const;
     bool IsEventAllowedInSession(const edict_t *player, int eventId) const;
+    bool HasReadyWeaponForEvent(int eventId) const;
     bool IsMovementSafe(const edict_t *player) const;
     int CountChaosEntities() const;
     bool HasEntityHeadroom() const;
 
     int PickNextEventId(const edict_t *pPlayer);
+    int PickRandomIndex(int count);
     void ExecuteEvent(edict_t *pPlayer, int eventId);
     void ClearAllModifiers(edict_t *pPlayer, bool restoreEngineCvars);
     void SuspendUnsafeEffects(edict_t *pPlayer);
@@ -117,7 +124,7 @@ private:
     void UpdateItemQueue(edict_t *pPlayer);
     void ClearItemQueue();
     void StripPlayerWeapons(edict_t *pPlayer);
-    int LaunchNearbyEnemies(edict_t *pPlayer, float radius, float upwardVel);
+    int LaunchNearbyEnemies(edict_t *pPlayer, const Vec3 &center, float radius, float upwardVel);
 
     // Visual, sound & HUD helpers
     void PlayCueSound(edict_t *pPlayer, const char *sample, int pitch = PITCH_NORM);
@@ -128,6 +135,7 @@ private:
     void SendTeleportSplash(const Vec3 &pos);
     void SendImplosion(const Vec3 &pos, int radius, int count, int life10);
     void SendSetFOV(edict_t *pPlayer, int fov);
+    void UpdateHevHudColor(edict_t *pPlayer);
     void SendChatAndConsole(edict_t *pPlayer, const char *msg);
 
     void RefreshStatusHud(edict_t *pPlayer);
@@ -144,6 +152,9 @@ private:
     cvar_t m_cvarMonsters;
     cvar_t m_cvarSpawnLimit;
     cvar_t m_cvarIntroTroll;
+    cvar_t m_cvarAutoJump;
+    cvar_t m_cvarUncapBhop;
+    cvar_t m_cvarHevHud;
     bool   m_cvarsRegistered;
 
     // Captured UserMsg IDs
@@ -152,6 +163,9 @@ private:
     int m_msgScreenFade;
     int m_msgSayText;
     int m_msgTextMsg;
+    int m_msgHudColor;
+    int m_hudColorApplied;
+    float m_nextHudColorTime;
 
     // Only use stock classes/sounds already precached by the original game/map.
     bool m_classReady[64];
@@ -164,6 +178,11 @@ private:
     int      m_edictCount;
     int      m_clientMax;
     bool     m_serverActive;
+    // An FL_CLIENT edict alone is not evidence of an initialized netchan:
+    // save restoration creates it before the client has completed signon.
+    edict_t *m_networkPlayer;
+    int      m_networkPlayerIndex;
+    int      m_networkPlayerSerial;
     bool     m_restrictedContext;
 
     float m_flLastFrameTime;

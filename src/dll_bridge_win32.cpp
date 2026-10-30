@@ -86,13 +86,26 @@ bool Bridge_LoadOriginalGameDll() {
     snprintf(hlRoot, sizeof(hlRoot), "%s", modDir);
     StripLastPathComponent(hlRoot); // ...\Half-Life
 
-    char candidates[4][MAX_PATH];
-    snprintf(candidates[0], MAX_PATH, "%s\\hl_orig.dll", dllDir);
-    snprintf(candidates[1], MAX_PATH, "%s\\valve\\dlls\\hl.dll", hlRoot);
-    snprintf(candidates[2], MAX_PATH, "valve\\dlls\\hl.dll");
-    snprintf(candidates[3], MAX_PATH, "..\\valve\\dlls\\hl.dll");
+    // Avoid strrchr's private UCRT import in MinGW builds.
+    const char *profileName = modDir;
+    for (const char *p = modDir; *p; ++p)
+        if (*p == '\\' || *p == '/') profileName = p + 1;
+    const bool opforProfile = _stricmp(profileName, "hl_randomizer_opfor") == 0;
 
-    for (int i = 0; i < 4; ++i) {
+    char candidates[4][MAX_PATH] = {};
+    int candidateCount = 0;
+    if (opforProfile) {
+        // Refuse to use Valve's DLL in the OF profile: they do not have a
+        // compatible player, weapon implementation or guaranteed save ABI.
+        snprintf(candidates[candidateCount++], MAX_PATH, "%s\\gearbox\\dlls\\opfor.dll", hlRoot);
+    } else {
+        snprintf(candidates[candidateCount++], MAX_PATH, "%s\\hl_orig.dll", dllDir);
+        snprintf(candidates[candidateCount++], MAX_PATH, "%s\\valve\\dlls\\hl.dll", hlRoot);
+        snprintf(candidates[candidateCount++], MAX_PATH, "valve\\dlls\\hl.dll");
+        snprintf(candidates[candidateCount++], MAX_PATH, "..\\valve\\dlls\\hl.dll");
+    }
+
+    for (int i = 0; i < candidateCount; ++i) {
         if (IsSameFilePath(selfPath, candidates[i])) {
             continue;
         }
@@ -109,8 +122,11 @@ bool Bridge_LoadOriginalGameDll() {
 
     if (!g_hGameModule) {
         MessageBoxA(nullptr,
-                    "Half-Life Randomizer Chaos could not find original 'valve\\dlls\\hl.dll'.\n"
-                    "Make sure the 'hl_randomizer' folder is placed inside your 'Half-Life' directory!",
+                    opforProfile
+                        ? "Opposing Force profile: could not load 'gearbox\\dlls\\opfor.dll'.\n"
+                          "Install Opposing Force next to hl_randomizer_opfor. The Valve DLL will not be used instead."
+                        : "Half-Life Randomizer Chaos could not find original 'valve\\dlls\\hl.dll'.\n"
+                          "Make sure the 'hl_randomizer' folder is placed inside your 'Half-Life' directory!",
                     "HL1 Randomizer Chaos Error",
                     MB_OK | MB_ICONERROR);
         return false;
@@ -231,6 +247,7 @@ typedef void (__cdecl *PFN_ENTITY_FN)(entvars_t *);
         if (fn) fn(pev); \
     }
 #include "hl_entity_list.inc"
+#include "opfor_entity_list.inc"
 #undef HL_ENTITY_LINK
 
 extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {

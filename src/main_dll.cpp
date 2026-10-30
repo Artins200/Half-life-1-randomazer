@@ -27,7 +27,7 @@ extern "C" const enginefuncs_t *ChaosTestHookedEngine() { return &g_hookedEngfun
 #endif
 
 // ============================================================================
-// Engine callback hooks passed to original valve/dlls/hl.dll
+// Engine callback hooks passed to the selected original Valve or Gearbox DLL
 // ============================================================================
 
 static int Hook_PrecacheSound(char *s) {
@@ -45,7 +45,7 @@ static edict_t *Hook_CreateNamedEntity(int classname) {
 
 static int Hook_RegUserMsg(const char *pszName, int iSize) {
     int msgId = g_engfuncs.pfnRegUserMsg ? g_engfuncs.pfnRegUserMsg(pszName, iSize) : 0;
-    g_chaos.OnRegUserMsg(pszName, msgId);
+    g_chaos.OnRegUserMsg(pszName, msgId, iSize);
     return msgId;
 }
 
@@ -131,6 +131,14 @@ static void Hook_ClientPutInServer(edict_t *pEntity) {
     g_chaos.OnClientPutInServer(pEntity);
 }
 
+static void Hook_ClientDisconnect(edict_t *pEntity) {
+    // Stop our sends before the engine tears down this client's buffers.
+    g_chaos.OnClientDisconnect(pEntity);
+    if (g_origDllFuncs.pfnClientDisconnect) {
+        g_origDllFuncs.pfnClientDisconnect(pEntity);
+    }
+}
+
 static void Hook_ClientKill(edict_t *pEntity) {
     g_deathCounter.OnClientKill();
     if (g_origDllFuncs.pfnClientKill) {
@@ -152,6 +160,14 @@ static void Hook_StartFrame(void) {
         g_origDllFuncs.pfnStartFrame();
     }
     g_chaos.OnStartFrame();
+}
+
+static void Hook_PlayerMove(struct playermove_s *move, qboolean server) {
+    if (!g_origDllFuncs.pfnPM_Move) return;
+    ChaosManager::MovementOverride state;
+    g_chaos.BeforePlayerMove(move, server, state);
+    g_origDllFuncs.pfnPM_Move(move, server);
+    g_chaos.AfterPlayerMove(move, state);
 }
 
 static void Hook_PlayerPreThink(edict_t *pEntity) {
@@ -182,11 +198,13 @@ static void InstallDllHooks(DLL_FUNCTIONS *pFunctionTable) {
     pFunctionTable->pfnServerActivate     = Hook_ServerActivate;
     pFunctionTable->pfnServerDeactivate   = Hook_ServerDeactivate;
     pFunctionTable->pfnClientPutInServer  = Hook_ClientPutInServer;
+    pFunctionTable->pfnClientDisconnect   = Hook_ClientDisconnect;
     pFunctionTable->pfnClientKill         = Hook_ClientKill;
     pFunctionTable->pfnClientCommand      = Hook_ClientCommand;
     pFunctionTable->pfnStartFrame         = Hook_StartFrame;
     pFunctionTable->pfnPlayerPreThink     = Hook_PlayerPreThink;
     pFunctionTable->pfnPlayerPostThink    = Hook_PlayerPostThink;
+    if (g_origDllFuncs.pfnPM_Move) pFunctionTable->pfnPM_Move = Hook_PlayerMove;
     pFunctionTable->pfnGetGameDescription = Hook_GetGameDescription;
 }
 

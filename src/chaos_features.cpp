@@ -8,8 +8,8 @@
 #include <sys/stat.h>
 #include <errno.h>
 
-// All of these abilities use the original game DLL and stock effects. They do
-// not require any third-party models, sounds, maps, or engine modification.
+// Abilities use the active original game DLL and its already-prepared effects.
+// Optional Gearbox weapons require the user's installed Opposing Force files.
 static bool SafePlayerContents(const Vec3 &origin, int hull) {
     if (!g_engfuncs.pfnPointContents || g_engfuncs.pfnPointContents(origin) != CONTENTS_EMPTY) return false;
     // The hull centre can be above lava/slime/water while the player's feet
@@ -387,13 +387,30 @@ void ChaosManager::BlinkForward(edict_t *player) {
 }
 
 void ChaosManager::GiveOpforInspiredLoadout(edict_t *player) {
-    // Stock analogues, never try to instantiate nonexistent gearbox classes.
-    QueueItemToPlayer(player, "weapon_9mmAR");
-    QueueItemToPlayer(player, "ammo_9mmAR");
-    QueueItemToPlayer(player, "weapon_shotgun");
-    QueueItemToPlayer(player, "ammo_buckshot");
-    QueueItemToPlayer(player, "weapon_gauss");
-    QueueItemToPlayer(player, "ammo_gaussclip");
+    // Give only one prepared OF weapon per event; don't flood the player with
+    // the entire arsenal. The ordinary profile retains a stock fallback.
+    const ChaosWeaponGiftDef *ready[CHAOS_OPFOR_WEAPON_GIFT_COUNT];
+    int count = 0;
+    for (int i = 0; i < CHAOS_OPFOR_WEAPON_GIFT_COUNT; ++i) {
+        const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(CHAOS_OPFOR_WEAPON_GIFT_START + i);
+        if (gift && IsClassReady(gift->weapon)) ready[count++] = gift;
+    }
+    if (count) {
+        const ChaosWeaponGiftDef *gift = ready[PickRandomIndex(count)];
+        QueueItemToPlayer(player, gift->weapon);
+        if (gift->ammo) QueueItemToPlayer(player, gift->ammo);
+        if (gift->bonusAmmo) QueueItemToPlayer(player, gift->bonusAmmo);
+        return;
+    }
+    if (IsClassReady("weapon_9mmAR") || IsClassReady("weapon_shotgun")) {
+        QueueItemToPlayer(player, "weapon_9mmAR");
+        QueueItemToPlayer(player, "ammo_9mmAR");
+        QueueItemToPlayer(player, "weapon_shotgun");
+        QueueItemToPlayer(player, "ammo_buckshot");
+    } else {
+        QueueItemToPlayer(player, "weapon_gauss");
+        QueueItemToPlayer(player, "ammo_gaussclip");
+    }
 }
 
 void ChaosManager::RunTheme(edict_t *player, int theme) {

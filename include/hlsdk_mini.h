@@ -589,6 +589,7 @@ typedef struct {
 #define FL_PARTIALGROUND    (1 << 10)
 #define FL_WATERJUMP        (1 << 11)
 #define FL_FROZEN           (1 << 12)
+#define FL_FAKECLIENT       (1 << 13)
 #define FL_DUCKING          (1 << 14)
 #define FL_BASEVELOCITY     (1 << 22)
 #define FL_ONTRAIN          (1 << 24)
@@ -689,6 +690,7 @@ typedef struct {
 
 #define WEAPON_SUIT         31
 #define SF_NORESPAWN        (1 << 30) // Valve cbase.h: never respawn an item
+#define SF_MONSTER_FADECORPSE (1 << 9) // Valve monsters.h: fade spawned NPC corpses
 
 // Compile-time x86 GoldSrc ABI layout checks
 #if INTPTR_MAX == INT32_MAX

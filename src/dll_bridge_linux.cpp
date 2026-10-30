@@ -63,15 +63,27 @@ bool Bridge_LoadOriginalGameDll() {
     snprintf(hlRoot, sizeof(hlRoot), "%s", modDir);
     StripComponent(hlRoot); // .../Half-Life
 
-    char candidates[6][PATH_MAX];
-    snprintf(candidates[0], PATH_MAX, "%s/hl_orig.so", dllDir);
-    snprintf(candidates[1], PATH_MAX, "%s/valve/dlls/hl.so", hlRoot);
-    snprintf(candidates[2], PATH_MAX, "%s/valve/dlls/hl_i386.so", hlRoot);
-    snprintf(candidates[3], PATH_MAX, "valve/dlls/hl.so");
-    snprintf(candidates[4], PATH_MAX, "valve/dlls/hl_i386.so");
-    snprintf(candidates[5], PATH_MAX, "../valve/dlls/hl.so");
+    const char *profileName = strrchr(modDir, '/');
+    profileName = profileName ? profileName + 1 : modDir;
+    const bool opforProfile = strcmp(profileName, "hl_randomizer_opfor") == 0;
 
-    for (int i = 0; i < 6; ++i) {
+    char candidates[6][PATH_MAX] = {};
+    int candidateCount = 0;
+    if (opforProfile) {
+        // Never fall back to Valve's DLL in this profile: its player/weapon
+        // implementation and saved-game ABI are not Opposing Force's.
+        snprintf(candidates[candidateCount++], PATH_MAX, "%s/gearbox/dlls/opfor.so", hlRoot);
+        snprintf(candidates[candidateCount++], PATH_MAX, "%s/gearbox/dlls/opfor_i386.so", hlRoot);
+    } else {
+        snprintf(candidates[candidateCount++], PATH_MAX, "%s/hl_orig.so", dllDir);
+        snprintf(candidates[candidateCount++], PATH_MAX, "%s/valve/dlls/hl.so", hlRoot);
+        snprintf(candidates[candidateCount++], PATH_MAX, "%s/valve/dlls/hl_i386.so", hlRoot);
+        snprintf(candidates[candidateCount++], PATH_MAX, "valve/dlls/hl.so");
+        snprintf(candidates[candidateCount++], PATH_MAX, "valve/dlls/hl_i386.so");
+        snprintf(candidates[candidateCount++], PATH_MAX, "../valve/dlls/hl.so");
+    }
+
+    for (int i = 0; i < candidateCount; ++i) {
         char candReal[PATH_MAX] = {0};
         if (realpath(candidates[i], candReal) && selfReal[0] != '\0') {
             if (strcmp(candReal, selfReal) == 0) {
@@ -89,7 +101,9 @@ bool Bridge_LoadOriginalGameDll() {
     }
 
     if (!g_hGameSo) {
-        fprintf(stderr, "[HL1 Chaos Mod] Could not find original valve/dlls/hl.so!\n");
+        fprintf(stderr, opforProfile
+            ? "[HL1 Chaos Mod] Opposing Force profile: could not load gearbox/dlls/opfor.so. Install Opposing Force; no Valve DLL fallback.\n"
+            : "[HL1 Chaos Mod] Could not find original valve/dlls/hl.so!\n");
         return false;
     }
 
@@ -185,7 +199,7 @@ const char *Bridge_ResolveNameForFunction(uint32_t functionAddr) {
     return nullptr;
 }
 
-// Forward all 250 canonical Half-Life 1 entity spawn symbols on Linux
+// Forward Half-Life and Opposing Force entity spawn symbols on Linux.
 #define HL_ENTITY_LINK(entityName) \
     extern "C" __attribute__((visibility("default"))) void entityName(entvars_t *pev) { \
         static PFN_ENTITY_FN s_fn = nullptr; \
@@ -198,6 +212,7 @@ const char *Bridge_ResolveNameForFunction(uint32_t functionAddr) {
     }
 
 #include "hl_entity_list.inc"
+#include "opfor_entity_list.inc"
 
 #undef HL_ENTITY_LINK
 

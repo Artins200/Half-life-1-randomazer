@@ -15,11 +15,23 @@ out/
 hl_randomizer/chaos_stats.cfg
 hl_randomizer/deaths.txt
 hl_randomizer/SAVE/
+hl_randomizer/save/
 hl_randomizer/config.cfg
 hl_randomizer/custom.hpk
 hl_randomizer/chaos_stats.cfg.tmp
 hl_randomizer/deaths.txt.tmp
 
+# The experimental OF profile has its own saves and a user-supplied Gearbox client.
+hl_randomizer_opfor/SAVE/
+hl_randomizer_opfor/save/
+hl_randomizer_opfor/cl_dlls/
+hl_randomizer_opfor/sprites/
+hl_randomizer_opfor/chaos_stats.cfg*
+hl_randomizer_opfor/deaths.txt*
+hl_randomizer_opfor/config.cfg
+hl_randomizer_opfor/custom.hpk
+
 # Local release archive and Python bytecode
 /hl_randomizer_chaos_ready.zip
+/hl_randomizer_chaos_v*.zip
 __pycache__/

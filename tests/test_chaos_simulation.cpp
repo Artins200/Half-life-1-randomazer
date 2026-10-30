@@ -1,4 +1,5 @@
 #include "hlsdk_mini.h"
+#include "hlsdk_pmove.h"
 #include "chaos_events.h"
 #include "chaos_features.h"
 #include "death_counter.h"
@@ -64,9 +65,22 @@ static bool g_blockHull = false;
 static bool g_blockPath = false;
 static bool g_dangerAtFeet = false;
 static int g_pointContents = CONTENTS_EMPTY;
+static int g_seenHullTypes = 0;
 static bool g_mapValid = true;
 static bool g_precacheCues = true;
+static bool g_precacheStockSnark = true;
+static bool g_precacheStockWeapons = true;
+static bool g_precacheOpforWeapons = false;
+// GoldSrc strings are 32-bit offsets, not signed indices. An original game
+// DLL literal may yield a value whose high bit is set (a negative int).
+static bool g_useHighBitPrecacheOffsets = false;
+static const char *g_mockHighBitClassName = nullptr;
+static const char *g_stockWeaponFilter = nullptr;
 static int g_emittedSounds = 0;
+static int g_sphereSearchCalls = 0;
+// GoldSrc may have a restored FL_CLIENT edict while the slot's netchan and
+// datagram are still zeroed. A write to either raises SZ_GetSpace/Sys_Error.
+static bool g_clientBufferInitialized = true;
 static const enginefuncs_t *g_testHookedEngine = nullptr;
 static entvars_t g_savedPlayerVars;
 static bool g_mutateFlagsDuringSave = false;
@@ -79,6 +93,7 @@ struct RecordedNetMsg {
     int type;
     int byteCount;
     int firstByte;
+    std::vector<int> bytes;
     std::vector<std::string> strings;
 };
 
@@ -143,7 +158,8 @@ static void Mock_TraceLine(const float *v1, const float *v2, int fNoMonsters, ed
 }
 
 static void Mock_TraceHull(const float *v1, const float *v2, int fNoMonsters, int hullNumber, edict_t *pentToSkip, TraceResult *ptr) {
-    (void)fNoMonsters; (void)hullNumber; (void)pentToSkip;
+    (void)fNoMonsters; (void)pentToSkip;
+    if (hullNumber >= 0 && hullNumber <= 3) g_seenHullTypes |= 1 << hullNumber;
     memset((void *)ptr, 0, sizeof(*ptr));
     if (g_blockHull && v1[0] == v2[0] && v1[1] == v2[1] && v1[2] == v2[2]) {
         ptr->fStartSolid = TRUE;
@@ -153,10 +169,13 @@ static void Mock_TraceHull(const float *v1, const float *v2, int fNoMonsters, in
         ptr->flFraction = 0.4f; // a closed door across a horizontal path
         return;
     }
-    // Simulate floor at z = 0
-    if (v2[2] < 0.0f && v1[2] >= 0.0f) {
-        ptr->flFraction = v1[2] / (v1[2] - v2[2]);
-        ptr->vecEndPos = Vec3(v1[0], v1[1], 0.0f);
+    // GoldSrc traces a centered hull. Its reference point stops one half
+    // height above the floor, rather than at z=0 for every hull size.
+    float halfHeight = hullNumber == human_hull ? 36.0f :
+                       (hullNumber == large_hull ? 32.0f : (hullNumber == head_hull ? 18.0f : 0.0f));
+    if (v2[2] < halfHeight && v1[2] >= halfHeight) {
+        ptr->flFraction = (v1[2] - halfHeight) / (v1[2] - v2[2]);
+        ptr->vecEndPos = Vec3(v1[0], v1[1], halfHeight);
     } else {
         ptr->flFraction = 1.0f;
         ptr->vecEndPos = Vec3(v2[0], v2[1], v2[2]);
@@ -169,12 +188,12 @@ static int Mock_DropToFloor(edict_t *e) {
 }
 
 static int Mock_PointContents(const float *rgflVector) {
-    if (g_dangerAtFeet && rgflVector[2] < 0.0f) return CONTENTS_WATER;
+    if (g_dangerAtFeet && rgflVector[2] < 10.0f) return CONTENTS_WATER;
     return g_pointContents;
 }
 
 static edict_t *Mock_CreateNamedEntity(int className) {
-    const char *cls = &g_stringPool[className];
+    const char *cls = g_mockHighBitClassName ? g_mockHighBitClassName : &g_stringPool[className];
     for (int i = 2; i < 128; ++i) {
         if (g_edicts[i].free) {
             memset((void *)&g_edicts[i], 0, sizeof(edict_t));
@@ -247,6 +266,7 @@ static edict_t *Mock_FindEntityByString(edict_t *pStart, const char *pszField, c
 
 static void Mock_ServerPrint(const char *msg) { if (msg) g_consoleOutput.push_back(msg); }
 static void Mock_ClientPrintf(edict_t *pEdict, PRINT_TYPE ptype, const char *msg) {
+    assert(g_clientBufferInitialized && "ClientPrintf wrote to an uninitialized netchan");
     (void)pEdict; (void)ptype; if (msg) g_consoleOutput.push_back(msg);
 }
 static void Mock_ServerCommand(char *str) {
@@ -258,17 +278,23 @@ static void Mock_ServerCommand(char *str) {
 }
 static int Mock_IsMapValid(char *name) { return g_mapValid && name && strcmp(name, "c1a1") == 0; }
 static edict_t *Mock_FindEntityInSphere(edict_t *start, const float *org, float radius) {
+    // GoldSrc returns worldspawn (edict 0), NOT nullptr, when there are no
+    // more matches. Continuing from it would restart the search forever.
+    assert(start != &g_edicts[0] && "sphere search continued past the worldspawn sentinel");
+    ++g_sphereSearchCalls;
     int first = start ? (int)(start - g_edicts) + 1 : 1;
     Vec3 center(org[0], org[1], org[2]);
     for (int i = first; i < g_numEdicts; ++i)
         if (!g_edicts[i].free && (g_edicts[i].v.origin - center).Length() <= radius) return &g_edicts[i];
-    return nullptr;
+    return &g_edicts[0];
 }
 static void Mock_ServerExecute(void) {}
 static void Mock_ClientCommand(edict_t *pEdict, char *szFmt, ...) { (void)pEdict; (void)szFmt; }
 
 static void Mock_MessageBegin(int msg_dest, int msg_type, const float *pOrigin, edict_t *ed) {
     (void)pOrigin; (void)ed;
+    if (msg_dest == MSG_ONE || msg_dest == MSG_ONE_UNRELIABLE)
+        assert(g_clientBufferInitialized && "SZ_GetSpace: uninitialized client sizebuf_t");
     assert(!g_inMessage && "Nested MessageBegin without MessageEnd!");
     g_inMessage = true;
     g_curMsg = RecordedNetMsg();
@@ -305,6 +331,10 @@ static void Mock_MessageEnd(void) {
             }
         } else if (g_curMsg.firstByte == TE_DLIGHT) {
             assert(g_curMsg.byteCount == 13 && "TE_DLIGHT must be exactly 13 bytes!");
+        } else if (g_curMsg.firstByte == TE_IMPLOSION) {
+            assert(g_curMsg.byteCount == 10 && "TE_IMPLOSION must be exactly 10 bytes!");
+        } else if (g_curMsg.firstByte == TE_TELEPORT) {
+            assert(g_curMsg.byteCount == 7 && "TE_TELEPORT must be exactly 7 bytes!");
         }
     } else if (g_curMsg.type == g_msgIdShake) {
         assert(g_curMsg.byteCount == 6 && "ScreenShake must be 6 bytes!");
@@ -324,6 +354,7 @@ static void Mock_MessageEnd(void) {
 static void Mock_WriteByte(int iValue) {
     assert(g_inMessage);
     if (g_curMsg.byteCount == 0) g_curMsg.firstByte = (iValue & 0xFF);
+    g_curMsg.bytes.push_back(iValue & 0xFF);
     g_curMsg.byteCount += 1;
 }
 static void Mock_WriteChar(int iValue) { (void)iValue; assert(g_inMessage); g_curMsg.byteCount += 1; }
@@ -394,10 +425,9 @@ static void Mock_MakeVectors(const float *rgflVector) {
 }
 
 static int Mock_RegUserMsg(const char *pszName, int iSize) {
-    (void)iSize;
     static int nextId = 64;
     int id = ++nextId;
-    g_chaos.OnRegUserMsg(pszName, id);
+    g_chaos.OnRegUserMsg(pszName, id, iSize);
     return id;
 }
 
@@ -431,6 +461,25 @@ static void Orig_GameInit(void) {
     g_msgIdSay   = Mock_RegUserMsg("SayText", -1);
 }
 
+static edict_t *Mock_WorldPrecacheEntity(const char *name) {
+    const int allocated = Mock_AllocString(name);
+    if (!g_useHighBitPrecacheOffsets)
+        return g_testHookedEngine->pfnCreateNamedEntity(allocated);
+
+    // Model MAKE_STRING(literal) in a real 32-bit game DLL. The engine has
+    // accepted this valid name even though its uint32 offset looks negative
+    // when passed as the int parameter of pfnCreateNamedEntity.
+    const int highBitOffset = INT32_MIN + 16;
+    const char *savedBase = g_mockGlobals.pStringBase;
+    g_mockGlobals.pStringBase = reinterpret_cast<const char *>(
+        reinterpret_cast<uintptr_t>(&g_stringPool[allocated]) - (uint32_t)highBitOffset);
+    g_mockHighBitClassName = name;
+    edict_t *result = g_testHookedEngine->pfnCreateNamedEntity(highBitOffset);
+    g_mockHighBitClassName = nullptr;
+    g_mockGlobals.pStringBase = savedBase;
+    return result;
+}
+
 static int Orig_Spawn(edict_t *pent) {
     if (!pent) return -1;
     const char *cls = &g_stringPool[pent->v.classname];
@@ -448,11 +497,24 @@ static int Orig_Spawn(edict_t *pent) {
             "items/medshot4.wav", "items/gunpickup2.wav", "items/weapondrop1.wav",
             "items/suitchargeno1.wav", "debris/zap4.wav", "buttons/button3.wav", "buttons/button10.wav"};
         for (const char *name : stock) {
-            int stringId = Mock_AllocString(name);
-            edict_t *e = g_testHookedEngine->pfnCreateNamedEntity(stringId);
+            if (!g_precacheStockSnark && strcmp(name, "monster_snark") == 0) continue;
+            if (strncmp(name, "weapon_", 7) == 0 &&
+                (!g_precacheStockWeapons || (g_stockWeaponFilter && strcmp(name, g_stockWeaponFilter) != 0))) continue;
+            edict_t *e = Mock_WorldPrecacheEntity(name);
             assert(e);
             g_precachedClasses.insert(name);
             Mock_RemoveEntity(e);
+        }
+        if (g_precacheOpforWeapons) {
+            static const char *opfor[] = {"weapon_pipewrench", "weapon_knife", "weapon_grapple", "weapon_eagle", "weapon_m249",
+                "weapon_sniperrifle", "weapon_sporelauncher", "weapon_shockrifle", "weapon_displacer",
+                "ammo_556", "ammo_762", "ammo_spore"};
+            for (const char *name : opfor) {
+                edict_t *e = Mock_WorldPrecacheEntity(name);
+                assert(e);
+                g_precachedClasses.insert(name);
+                Mock_RemoveEntity(e);
+            }
         }
         if (g_precacheCues) for (const char *cue : cues) g_testHookedEngine->pfnPrecacheSound((char *)cue);
         return 0;
@@ -472,6 +534,35 @@ static void Orig_Save(edict_t *entity, SAVERESTOREDATA *) {
         if (g_mutateFlagsDuringSave) entity->v.flags |= FL_FROZEN;
     }
 }
+static int g_origClientCommandCalls = 0;
+static void Orig_ClientCommand(edict_t *player) {
+    ++g_origClientCommandCalls;
+    // Stand in for the original GameDLL's cheat command and suit pickup.
+    if (player && g_cmdArgs.size() == 2 && g_cmdArgs[0] == "give" && g_cmdArgs[1] == "item_suit")
+        player->v.weapons |= (int)(1u << WEAPON_SUIT);
+}
+
+static int g_mockMoveCalls = 0;
+static float g_origMoveNewClientMax = -1;
+static void Orig_PlayerMove(playermove_s *move, qboolean) {
+    ++g_mockMoveCalls;
+    if (!move || !(g_edicts[1].v.button & IN_JUMP) || (move->oldbuttons & IN_JUMP) ||
+        !(move->flags & FL_ONGROUND) || move->movetype != MOVETYPE_WALK || move->dead) return;
+    // Emulate the classic PM_Jump momentum crop and held-button guard.
+    float speed = move->velocity.Length();
+    float maximum = move->maxspeed;
+    if (move->clientmaxspeed > 0 && move->clientmaxspeed < maximum) maximum = move->clientmaxspeed;
+    if (maximum > 0 && speed > 1.7f * maximum) {
+        float scale = 1.7f * maximum / speed * 0.65f;
+        move->velocity.x *= scale;
+        move->velocity.y *= scale;
+    }
+    move->velocity.z = 268.0f;
+    move->oldbuttons |= IN_JUMP;
+    move->flags &= ~FL_ONGROUND;
+    if (g_origMoveNewClientMax >= 0) move->clientmaxspeed = g_origMoveNewClientMax;
+}
+
 static void Orig_PlayerPreThink(edict_t *player) {
     if (player && !(player->v.flags & FL_ONGROUND)) g_origFallVelocity = -player->v.velocity.z;
 }
@@ -589,6 +680,8 @@ static void StartWorld(DLL_FUNCTIONS &dll, const char *map, float time, bool sui
     g_loadingMap = false;
     dll.pfnServerActivate(g_edicts, g_numEdicts, 1);
     dll.pfnClientPutInServer(&g_edicts[1]);
+    // Normal test worlds begin after the first spawned-client user command.
+    dll.pfnPlayerPreThink(&g_edicts[1]);
 }
 static void Step(DLL_FUNCTIONS &dll, float seconds, float dt = 0.2f) {
     int steps = (int)roundf(seconds / dt);
@@ -599,6 +692,166 @@ static void Step(DLL_FUNCTIONS &dll, float seconds, float dt = 0.2f) {
         dll.pfnPlayerPostThink(&g_edicts[1]);
     }
 }
+static void TestRestoreAndDisconnectLifecycle(DLL_FUNCTIONS &dll) {
+    printf("[lifecycle] Restored player before netchan, disconnect and resume...\n");
+    Mock_CVarSetFloat("chaos_enabled", 0);
+    g_clientBufferInitialized = true;
+    StartWorld(dll, "c1a2", 1, true);
+    dll.pfnPlayerPreThink(&g_edicts[1]);
+    g_chaos.CmdTriggerById(33); // leave a live SetFOV modifier at shutdown
+    assert(g_edicts[1].v.fov == 130);
+    // GoldSrc can inactivate/disconnect the slot before ServerDeactivate.
+    // No MSG_ONE or ClientPrintf may be issued to this old entity.
+    g_clientBufferInitialized = false;
+    dll.pfnServerDeactivate();
+
+    // A load restores the player's FL_CLIENT edict before the slot has a
+    // netchan. SV_ActivateServer may run StartFrame before signon; critically,
+    // SV_WriteSpawn skips ClientPutInServer for a loadgame.
+    ResetMockWorld("c1a2", 10, true);
+    assert(dll.pfnSpawn(&g_edicts[0]) >= 0);
+    g_loadingMap = false;
+    dll.pfnServerActivate(g_edicts, g_numEdicts, 1);
+    const int before = g_deathCounter.GetTotalEvents();
+    // Bot PreThink is not proof of a real client's network channel.
+    g_edicts[1].v.flags |= FL_FAKECLIENT;
+    dll.pfnPlayerPreThink(&g_edicts[1]);
+    g_edicts[1].v.flags &= ~FL_FAKECLIENT;
+    for (int i = 0; i < 60; ++i) {
+        g_mockGlobals.time += 0.2f;
+        dll.pfnStartFrame();
+    }
+    g_chaos.CmdTriggerById(33);
+    g_chaos.CmdPrintList(&g_edicts[1]);
+    assert(g_deathCounter.GetTotalEvents() == before);
+
+    // The first real player command calls PreThink after spawn/signon, even
+    // on loadgames where ClientPutInServer was never called.
+    g_clientBufferInitialized = true;
+    dll.pfnPlayerPreThink(&g_edicts[1]);
+    g_chaos.CmdTriggerById(33);
+    assert(g_edicts[1].v.fov == 130);
+    assert(g_deathCounter.GetTotalEvents() == before + 1);
+    assert(dll.pfnClientDisconnect);
+    g_clientBufferInitialized = false;
+    // An edict slot can be reused without a timely callback on every engine;
+    // an old readiness token must not authorize the replacement entity.
+    ++g_edicts[1].serialnumber;
+    g_mockGlobals.time += 1.0f;
+    dll.pfnStartFrame();
+    dll.pfnClientDisconnect(&g_edicts[1]);
+    for (int i = 0; i < 10; ++i) {
+        g_mockGlobals.time += 0.2f;
+        dll.pfnStartFrame();
+    }
+    dll.pfnServerDeactivate();
+    g_clientBufferInitialized = true;
+    Mock_CVarSetFloat("chaos_enabled", 1);
+}
+
+static bool Contains(const std::vector<std::string> &lines, const char *text);
+
+static void TestOpforWeaponDelivery(DLL_FUNCTIONS &dll) {
+    printf("[opfor] Valve rejects unprepared OF classes; Gearbox-style precache enables nine deliveries...\n");
+    Mock_CVarSetFloat("chaos_enabled", 0);
+    g_precacheOpforWeapons = false;
+    StartWorld(dll, "c1a2", 1, false);
+    g_consoleOutput.clear();
+    g_chaos.CmdTriggerById(494);
+    assert(Contains(g_consoleOutput, "костюм HEV"));
+
+    // The proxy forwards the stock cheat command and uses only the HEV bit;
+    // it does not require a separate vest or invent Gearbox private fields.
+    g_precacheOpforWeapons = true;
+    StartWorld(dll, "c1a2", 1, false);
+    g_cmdArgs = {"give", "item_suit"};
+    int forwarded = g_origClientCommandCalls;
+    dll.pfnClientCommand(&g_edicts[1]);
+    assert(g_origClientCommandCalls == forwarded + 1);
+    assert(g_edicts[1].v.weapons == (int)(1u << WEAPON_SUIT));
+    g_receivedItems.clear();
+    g_chaos.CmdTriggerById(480); Step(dll, 1.6f);
+    assert(std::find(g_receivedItems.begin(), g_receivedItems.end(), "weapon_shotgun") != g_receivedItems.end());
+    g_receivedItems.clear();
+    g_chaos.CmdTriggerById(494); Step(dll, 1.6f);
+    assert(std::find(g_receivedItems.begin(), g_receivedItems.end(), "weapon_eagle") != g_receivedItems.end());
+    g_precacheOpforWeapons = false;
+
+    StartWorld(dll, "c0a0", 1, true);
+    g_consoleOutput.clear();
+    g_chaos.CmdTriggerById(494);
+    assert(Contains(g_consoleOutput, "вступительной карте"));
+
+    StartWorld(dll, "c1a2", 1, true);
+    g_edicts[1].v.flags |= FL_ONTRAIN;
+    g_consoleOutput.clear();
+    g_chaos.CmdTriggerById(494);
+    assert(Contains(g_consoleOutput, "транспорта"));
+    g_edicts[1].v.flags &= ~FL_ONTRAIN;
+    g_consoleOutput.clear();
+    g_receivedItems.clear();
+    int before = g_deathCounter.GetTotalEvents();
+    for (int id = CHAOS_OPFOR_WEAPON_GIFT_START; id < CHAOS_EVENT_COUNT; ++id) g_chaos.CmdTriggerById(id);
+    assert(g_deathCounter.GetTotalEvents() == before && g_receivedItems.empty());
+    assert(Contains(g_consoleOutput, "weapon_eagle") && Contains(g_consoleOutput, "не подготовлен"));
+
+    // Null, free or uninitialized precache entities must never mark a class
+    // as ready, even when its string has the high bit set.
+    const int eagleString = Mock_AllocString("weapon_eagle");
+    const int highBitOffset = INT32_MIN + 16;
+    const char *savedBase = g_mockGlobals.pStringBase;
+    g_mockGlobals.pStringBase = reinterpret_cast<const char *>(
+        reinterpret_cast<uintptr_t>(&g_stringPool[eagleString]) - (uint32_t)highBitOffset);
+    edict_t freed = {}, noPrivate = {}, initialized = {};
+    freed.free = TRUE; freed.pvPrivateData = &freed;
+    initialized.pvPrivateData = &initialized;
+    g_chaos.OnWorldPrecacheBegin();
+    g_chaos.OnWorldEntityCreated(highBitOffset, nullptr);
+    g_chaos.OnWorldEntityCreated(highBitOffset, &freed);
+    g_chaos.OnWorldEntityCreated(highBitOffset, &noPrivate);
+    g_chaos.OnWorldEntityCreated(0, &initialized);
+    g_chaos.OnWorldPrecacheEnd();
+    g_mockGlobals.pStringBase = savedBase;
+    g_consoleOutput.clear();
+    g_chaos.CmdTriggerById(494);
+    assert(g_deathCounter.GetTotalEvents() == before && Contains(g_consoleOutput, "не подготовлен"));
+
+    g_precacheOpforWeapons = true;
+    // In the real DLL, MAKE_STRING may produce an int with the high bit set.
+    // Those resource classes must still be recognized and delivered.
+    g_useHighBitPrecacheOffsets = true;
+    StartWorld(dll, "c1a2", 1, true);
+    g_useHighBitPrecacheOffsets = false;
+    const int oldMaxEntities = g_mockGlobals.maxEntities;
+    g_mockGlobals.maxEntities = 16;
+    g_consoleOutput.clear();
+    g_chaos.CmdTriggerById(494);
+    assert(Contains(g_consoleOutput, "Недостаточно свободных игровых сущностей"));
+    g_mockGlobals.maxEntities = oldMaxEntities;
+    for (int id = CHAOS_OPFOR_WEAPON_GIFT_START; id < CHAOS_EVENT_COUNT; ++id) {
+        const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(id);
+        assert(gift);
+        g_receivedItems.clear();
+        before = g_deathCounter.GetTotalEvents();
+        g_chaos.CmdTriggerById(id);
+        Step(dll, 1.6f);
+        assert(g_deathCounter.GetTotalEvents() == before + 1);
+        assert(std::find(g_receivedItems.begin(), g_receivedItems.end(), gift->weapon) != g_receivedItems.end());
+        if (gift->ammo) assert(std::find(g_receivedItems.begin(), g_receivedItems.end(), gift->ammo) != g_receivedItems.end());
+    }
+    g_receivedItems.clear();
+    g_chaos.CmdTriggerById(42);
+    Step(dll, 5.0f);
+    int opforDelivered = 0;
+    for (int id = CHAOS_OPFOR_WEAPON_GIFT_START; id < CHAOS_EVENT_COUNT; ++id) {
+        const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(id);
+        if (std::find(g_receivedItems.begin(), g_receivedItems.end(), gift->weapon) != g_receivedItems.end()) ++opforDelivered;
+    }
+    assert(opforDelivered == 1 && "the OF kit should give one random weapon, not the entire arsenal");
+    assert(std::find(g_receivedItems.begin(), g_receivedItems.end(), "weapon_9mmAR") == g_receivedItems.end());
+    g_precacheOpforWeapons = false;
+}
+
 static int CountSpawned() {
     int result = 0;
     for (int i = 2; i < g_numEdicts; ++i)
@@ -625,6 +878,430 @@ static void WriteText(const char *path, const char *text) {
     FILE *fp = fopen(path, "wb"); assert(fp);
     assert(fwrite(text, 1, strlen(text), fp) == strlen(text));
     assert(fclose(fp) == 0);
+}
+
+static edict_t *Mock_StuckSphereSearch(edict_t *, const float *, float) {
+    ++g_sphereSearchCalls;
+    return &g_edicts[2]; // a broken engine returning the same edict forever
+}
+
+static void TestBombSearchAndBlast(DLL_FUNCTIONS &dll) {
+    printf("[3a] Bomb and disco stop at GoldSrc worldspawn; blast is bounded...\n");
+    Mock_CVarSetFloat("chaos_enabled", 0);
+    StartWorld(dll, "c1a2", 1, true);
+    Mock_RemoveEntity(&g_edicts[2]); // no launchable enemies, only a named scientist
+    g_sphereSearchCalls = 0;
+    g_chaos.CmdTriggerById(27);
+    Step(dll, 2.8f);
+    assert(g_sphereSearchCalls == 0); // the fuse has not expired
+    Step(dll, 0.4f);
+    assert(g_sphereSearchCalls > 0 && g_sphereSearchCalls <= g_numEdicts + 1);
+    assert(g_edicts[1].v.health == 85 && g_edicts[1].v.velocity.z > 0);
+    assert(g_edicts[3].v.velocity.Length() == 0 && g_edicts[3].v.health == 20);
+    const int afterExplosion = g_sphereSearchCalls;
+    Step(dll, 4);
+    assert(g_sphereSearchCalls == afterExplosion); // detonates only once
+
+    // The shockwave is centered on the original bomb, not the player's new
+    // position after moving away during the fuse.
+    StartWorld(dll, "c1a2", 1, true);
+    g_edicts[2].v.origin = Vec3(200, 200, 36);
+    edict_t *farEnemy = Mock_CreateNamedEntity(Mock_AllocString("monster_zombie"));
+    assert(farEnemy);
+    farEnemy->v.origin = Vec3(800, 200, 36);
+    g_chaos.CmdTriggerById(27);
+    g_edicts[1].v.origin = Vec3(800, 200, 36);
+    Step(dll, 3.4f);
+    assert(g_edicts[2].v.velocity.z == 480 && farEnemy->v.velocity.z == 0);
+    assert(g_edicts[1].v.health == 100 && g_edicts[1].v.velocity.Length() == 0);
+    assert(g_edicts[3].v.velocity.Length() == 0);
+
+    StartWorld(dll, "c1a2", 1, true);
+    edict_t *named = Mock_CreateNamedEntity(Mock_AllocString("monster_zombie"));
+    assert(named);
+    named->v.targetname = Mock_AllocString("important_script_character");
+    named->v.origin = Vec3(210, 200, 36);
+    for (int i = 0; i < 9; ++i) {
+        edict_t *enemy = Mock_CreateNamedEntity(Mock_AllocString("monster_zombie"));
+        assert(enemy);
+        enemy->v.origin = Vec3(200 + (float)i, 200, 36);
+    }
+    g_chaos.CmdTriggerById(27); Step(dll, 3.4f);
+    int launched = 0;
+    for (int i = 2; i < g_numEdicts; ++i)
+        if (!g_edicts[i].free && g_edicts[i].v.velocity.z == 480) ++launched;
+    assert(launched == 8 && named->v.velocity.Length() == 0 && g_edicts[3].v.velocity.Length() == 0);
+
+    // All routes to the shared bomb implementation, plus the disco event.
+    const int bombIds[] = {43, CHAOS_RECIPE_START + 2 * CHAOS_VARIANT_COUNT,
+                           CHAOS_RECIPE_START + 14 * CHAOS_VARIANT_COUNT};
+    for (int id : bombIds) {
+        StartWorld(dll, "c1a2", 1, true);
+        g_sphereSearchCalls = 0;
+        g_chaos.CmdTriggerById(id); Step(dll, 3.4f);
+        assert(g_sphereSearchCalls > 0 && g_sphereSearchCalls <= g_numEdicts + 1);
+    }
+    StartWorld(dll, "c1a2", 1, true);
+    g_sphereSearchCalls = 0;
+    g_chaos.CmdTriggerById(37);
+    assert(g_sphereSearchCalls > 0 && g_sphereSearchCalls <= g_numEdicts + 1);
+
+    // IndexOfEdict is a valid world-sentinel fallback if EntOffset is absent.
+    StartWorld(dll, "c1a2", 1, true);
+    auto offset = g_engfuncs.pfnEntOffsetOfPEntity;
+    g_engfuncs.pfnEntOffsetOfPEntity = nullptr;
+    g_sphereSearchCalls = 0;
+    g_chaos.CmdTriggerById(27); Step(dll, 3.4f);
+    assert(g_sphereSearchCalls > 0 && g_sphereSearchCalls <= g_numEdicts + 1);
+    g_engfuncs.pfnEntOffsetOfPEntity = offset;
+
+    // Defensive termination even if an engine/mod repeatedly returns one edict.
+    StartWorld(dll, "c1a2", 1, true);
+    auto findSphere = g_engfuncs.pfnFindEntityInSphere;
+    g_engfuncs.pfnFindEntityInSphere = Mock_StuckSphereSearch;
+    g_sphereSearchCalls = 0;
+    g_chaos.CmdTriggerById(37);
+    assert(g_sphereSearchCalls == 2);
+    g_engfuncs.pfnFindEntityInSphere = findSphere;
+}
+
+static int WaitForAutomaticEvent(DLL_FUNCTIONS &dll) {
+    const int before = g_deathCounter.GetTotalEvents();
+    for (int i = 0; i < 20 && g_deathCounter.GetTotalEvents() == before; ++i) Step(dll, 0.2f);
+    assert(g_deathCounter.GetTotalEvents() == before + 1 && "automatic chaos timer stalled");
+    return g_chaos.GetLastEventId();
+}
+
+static bool IsWeaponDropEvent(int id) {
+    return id == 22 || id == 23 || id == 42 || ChaosGetWeaponGift(id);
+}
+
+static bool HasReceivedWeapon() {
+    for (const std::string &item : g_receivedItems)
+        if (item.compare(0, 7, "weapon_") == 0) return true;
+    return false;
+}
+
+static void TestHeldJumpAndMomentum(DLL_FUNCTIONS &dll) {
+    printf("[movement] Held jump, momentum, opt-outs and single-player safety...\n");
+    Mock_CVarSetFloat("chaos_enabled", 0);
+    Mock_CVarSetFloat("chaos_autojump", 1);
+    Mock_CVarSetFloat("chaos_bhop_nocap", 1);
+    StartWorld(dll, "c1a2", 1, true);
+    g_edicts[1].v.button = IN_JUMP;
+    playermove_s move = {};
+    move.player_index = 0;
+    move.movetype = MOVETYPE_WALK;
+    move.flags = FL_CLIENT | FL_ONGROUND;
+    move.oldbuttons = IN_JUMP | IN_DUCK;
+    move.maxspeed = 320;
+    move.clientmaxspeed = 300;
+    move.velocity = Vec3(1000, 0, 0);
+    int calls = g_mockMoveCalls;
+    dll.pfnPM_Move(&move, TRUE);
+    assert(g_mockMoveCalls == calls + 1 && move.velocity.z == 268 && move.velocity.x == 1000);
+    assert(move.maxspeed == 320 && move.clientmaxspeed == 300);
+    assert((move.oldbuttons & (IN_JUMP | IN_DUCK)) == (IN_JUMP | IN_DUCK) && !(move.flags & FL_ONGROUND));
+    assert(g_edicts[1].v.maxspeed == 320 && Mock_CVarGetFloat("sv_maxspeed") == 320);
+    // Landing while still holding jump should trigger another jump.
+    move.flags |= FL_ONGROUND; move.velocity.z = 0;
+    dll.pfnPM_Move(&move, TRUE);
+    assert(move.velocity.z == 268 && move.velocity.x == 1000);
+
+    // Neither prediction calls nor unsafe movement are modified.
+    move.flags |= FL_ONGROUND; move.velocity.z = 0; move.oldbuttons = IN_JUMP;
+    dll.pfnPM_Move(&move, FALSE); assert(move.velocity.z == 0 && move.oldbuttons == IN_JUMP);
+    g_edicts[1].v.flags &= ~FL_ONGROUND;
+    move.flags &= ~FL_ONGROUND;
+    dll.pfnPM_Move(&move, TRUE); assert(move.velocity.z == 0 && move.oldbuttons == IN_JUMP);
+    move.flags |= FL_ONGROUND; g_edicts[1].v.flags |= FL_ONGROUND | FL_FROZEN;
+    dll.pfnPM_Move(&move, TRUE); assert(move.velocity.z == 0 && move.oldbuttons == IN_JUMP);
+    g_edicts[1].v.flags &= ~FL_FROZEN;
+    g_edicts[1].v.flags |= FL_ONTRAIN;
+    dll.pfnPM_Move(&move, TRUE); assert(move.velocity.z == 0 && move.oldbuttons == IN_JUMP);
+    g_edicts[1].v.flags &= ~FL_ONTRAIN;
+    move.dead = TRUE;
+    dll.pfnPM_Move(&move, TRUE); assert(move.velocity.z == 0 && move.oldbuttons == IN_JUMP);
+    move.dead = FALSE;
+    g_edicts[1].v.waterlevel = 2;
+    dll.pfnPM_Move(&move, TRUE); assert(move.velocity.z == 0 && move.oldbuttons == IN_JUMP);
+    g_edicts[1].v.waterlevel = 0;
+    move.movetype = MOVETYPE_FLY; g_edicts[1].v.movetype = MOVETYPE_FLY;
+    dll.pfnPM_Move(&move, TRUE); assert(move.velocity.z == 0 && move.oldbuttons == IN_JUMP);
+    move.movetype = MOVETYPE_WALK; g_edicts[1].v.movetype = MOVETYPE_WALK;
+    g_mockGlobals.deathmatch = 1;
+    dll.pfnPM_Move(&move, TRUE); assert(move.velocity.z == 0 && move.oldbuttons == IN_JUMP);
+    g_mockGlobals.deathmatch = 0;
+
+    // Each setting can be disabled independently, even while chaos is paused.
+    Mock_CVarSetFloat("chaos_autojump", 0);
+    dll.pfnPM_Move(&move, TRUE); assert(move.velocity.z == 0 && move.oldbuttons == IN_JUMP);
+    Mock_CVarSetFloat("chaos_autojump", 1);
+    Mock_CVarSetFloat("chaos_bhop_nocap", 0);
+    dll.pfnPM_Move(&move, TRUE);
+    assert(move.velocity.z == 268 && move.velocity.x < 400 && move.maxspeed == 320 && move.clientmaxspeed == 300);
+    Mock_CVarSetFloat("chaos_bhop_nocap", 1);
+    move.flags |= FL_ONGROUND; move.velocity = Vec3(1000, 0, 0); move.oldbuttons = 0;
+    move.clientmaxspeed = 0; // valid engine default must remain zero
+    dll.pfnPM_Move(&move, TRUE);
+    assert(move.velocity.x == 1000 && move.clientmaxspeed == 0 && move.maxspeed == 320);
+    move.flags |= FL_ONGROUND; move.velocity = Vec3(1000, 0, 0); move.oldbuttons = 0;
+    move.clientmaxspeed = 300; g_origMoveNewClientMax = 245;
+    dll.pfnPM_Move(&move, TRUE);
+    assert(move.clientmaxspeed == 245 && move.maxspeed == 320); // keep original's change
+    g_origMoveNewClientMax = -1;
+    g_edicts[1].v.button = 0;
+}
+
+static void TestHudColorLifecycle(DLL_FUNCTIONS &dll) {
+    printf("[hud] Registered 3-byte OF color, opt-out, timing and disconnect safety...\n");
+    Mock_CVarSetFloat("chaos_enabled", 0);
+    Mock_CVarSetFloat("chaos_hev_hud", 1);
+    const int badId = g_testHookedEngine->pfnRegUserMsg("HudColor", 2);
+    StartWorld(dll, "c1a2", 1, true);
+    g_allMessages.clear(); Step(dll, 0.2f);
+    for (const auto &m : g_allMessages) assert(m.type != badId);
+    const int id = g_testHookedEngine->pfnRegUserMsg("HudColor", 3);
+    g_allMessages.clear(); Step(dll, 0.2f);
+    int orange = 0;
+    for (const auto &m : g_allMessages) if (m.type == id) {
+        assert(m.dest == MSG_ONE && m.bytes == std::vector<int>({255, 160, 0}));
+        ++orange;
+    }
+    assert(orange == 1);
+    g_allMessages.clear(); Step(dll, 4.0f);
+    for (const auto &m : g_allMessages) assert(m.type != id);
+    g_allMessages.clear(); Step(dll, 1.2f);
+    for (const auto &m : g_allMessages) if (m.type == id) ++orange;
+    assert(orange == 2); // periodically recover from a client HUD reset
+    Mock_CVarSetFloat("chaos_hev_hud", 0);
+    g_allMessages.clear(); Step(dll, 0.2f);
+    int green = 0;
+    for (const auto &m : g_allMessages) if (m.type == id) {
+        assert(m.bytes == std::vector<int>({0, 160, 0}));
+        ++green;
+    }
+    assert(green == 1);
+    g_allMessages.clear(); Step(dll, 5.2f);
+    for (const auto &m : g_allMessages) assert(m.type != id);
+    Mock_CVarSetFloat("chaos_hev_hud", 1);
+    g_allMessages.clear(); Step(dll, 0.2f);
+    bool reenabled = false;
+    for (const auto &m : g_allMessages) if (m.type == id && m.bytes == std::vector<int>({255, 160, 0})) reenabled = true;
+    assert(reenabled);
+    // An inactive slot must not receive a reliable user message.
+    g_clientBufferInitialized = false;
+    dll.pfnClientDisconnect(&g_edicts[1]);
+    g_allMessages.clear(); dll.pfnStartFrame();
+    for (const auto &m : g_allMessages) assert(m.type != id);
+    g_clientBufferInitialized = true;
+    // Disable the mock message for unrelated lifecycle tests.
+    g_testHookedEngine->pfnRegUserMsg("HudColor", 2);
+}
+
+static void TestNpcWeaponPriority(DLL_FUNCTIONS &dll) {
+    printf("[3b] NPC spawn safety, fourteen real weapon deliveries and weighted automatic events...\n");
+    Mock_CVarSetFloat("chaos_enabled", 0);
+    Mock_CVarSetFloat("chaos_monsters", 1);
+    Mock_CVarSetFloat("chaos_spawn_limit", 8);
+    StartWorld(dll, "c1a2", 1, true);
+
+    // Exercise every standalone NPC event and check the actual spawned
+    // entities, not just the event banner. Hull traces must enclose the
+    // stock monster's bottom-at-origin box and avoid damaging floor contents.
+    for (int id = 0; id < 12; ++id) {
+        RemoveSpawned();
+        g_seenHullTypes = 0;
+        const int before = g_deathCounter.GetTotalEvents();
+        g_chaos.CmdTriggerById(id);
+        assert(g_deathCounter.GetTotalEvents() == before + 1);
+        assert(CountSpawned() >= 1 && CountSpawned() <= 3);
+        if (id == 3 || id == 7) assert(g_seenHullTypes & (1 << large_hull));
+        for (int i = 2; i < g_numEdicts; ++i) if (!g_edicts[i].free && g_edicts[i].v.iuser4 == 0xC4A05) {
+            assert((g_edicts[i].v.spawnflags & SF_MONSTER_FADECORPSE) != 0);
+            assert(fabsf(g_edicts[i].v.origin.z - 2.0f) < 0.01f);
+        }
+        Step(dll, 0.4f);
+    }
+    RemoveSpawned();
+    g_consoleOutput.clear();
+    g_blockHull = true; g_chaos.CmdTriggerById(0); assert(CountSpawned() == 0);
+    assert(Contains(g_consoleOutput, "НПС не создан"));
+    Step(dll, 0.4f); g_blockHull = false;
+    g_dangerAtFeet = true; g_chaos.CmdTriggerById(0); assert(CountSpawned() == 0);
+    Step(dll, 0.4f); g_dangerAtFeet = false;
+    int rejected = g_deathCounter.GetTotalEvents();
+    Mock_CVarSetFloat("chaos_monsters", NAN);
+    g_chaos.CmdTriggerById(8);
+    assert(g_deathCounter.GetTotalEvents() == rejected && CountSpawned() == 0);
+    Mock_CVarSetFloat("chaos_monsters", 1);
+    auto removeEntity = g_engfuncs.pfnRemoveEntity;
+    g_engfuncs.pfnRemoveEntity = nullptr;
+    g_chaos.CmdTriggerById(8); g_chaos.CmdTriggerById(480);
+    assert(g_deathCounter.GetTotalEvents() == rejected && CountSpawned() == 0);
+    g_engfuncs.pfnRemoveEntity = removeEntity;
+    for (int i = 0; i < 3; ++i) { g_chaos.CmdTriggerById(8); Step(dll, 0.4f); }
+    assert(CountSpawned() == 8);
+    int before = g_deathCounter.GetTotalEvents();
+    g_chaos.CmdTriggerById(8);
+    assert(g_deathCounter.GetTotalEvents() == before && CountSpawned() == 8);
+    // The original game removes a faded corpse; the freed slot permits more.
+    for (int i = 2; i < g_numEdicts; ++i) if (!g_edicts[i].free && g_edicts[i].v.iuser4 == 0xC4A05) {
+        Mock_RemoveEntity(&g_edicts[i]); break;
+    }
+    Step(dll, 0.4f); g_chaos.CmdTriggerById(8);
+    assert(CountSpawned() == 8);
+
+    StartWorld(dll, "c1a2", 1, true);
+    for (int id = CHAOS_WEAPON_GIFT_START; id < CHAOS_OPFOR_WEAPON_GIFT_START; ++id) {
+        const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(id);
+        assert(gift && gift->event.id == id);
+        g_receivedItems.clear();
+        before = g_deathCounter.GetTotalEvents();
+        g_chaos.CmdTriggerById(id); Step(dll, 1.6f);
+        assert(g_deathCounter.GetTotalEvents() == before + 1);
+        assert(std::find(g_receivedItems.begin(), g_receivedItems.end(), gift->weapon) != g_receivedItems.end());
+        if (gift->ammo) assert(std::find(g_receivedItems.begin(), g_receivedItems.end(), gift->ammo) != g_receivedItems.end());
+    }
+
+    // Count the actual timer-driven selection, with spawned entities removed
+    // between samples so the normal eight-NPC limit does not bias the test.
+    Mock_CVarSetFloat("chaos_interval", 2);
+    Mock_CVarSetFloat("chaos_enabled", 1);
+    StartWorld(dll, "c1a2", 1, true);
+    int npc = 0, weapons = 0, other = 0, recipes = 0;
+    for (int n = 0; n < 600; ++n) {
+        RemoveSpawned();
+        g_edicts[1].v.health = 100;
+        g_receivedItems.clear();
+        int id = WaitForAutomaticEvent(dll);
+        if (id < 12) {
+            ++npc;
+            assert(CountSpawned() >= 1 && CountSpawned() <= 3);
+        } else if (IsWeaponDropEvent(id)) {
+            ++weapons;
+        } else if (ChaosRecipeTheme(id) >= 0) {
+            ++recipes;
+            assert(!(ChaosRecipeTheme(id) == 15 && (ChaosRecipeVariant(id) == 8 || ChaosRecipeVariant(id) == 9)));
+        } else {
+            ++other;
+        }
+        Step(dll, 0.4f); // queued weapons are actually delivered, at most two per tick
+        if (IsWeaponDropEvent(id)) assert(HasReceivedWeapon());
+        g_allMessages.clear(); g_consoleOutput.clear();
+    }
+    printf("    600 automatic events: NPC=%d weapons=%d other=%d combinations=%d\n", npc, weapons, other, recipes);
+    assert(npc >= 250 && npc <= 400);
+    assert(weapons >= 140 && weapons <= 260);
+    assert(npc + weapons >= 450 && recipes <= 75);
+    assert(other > 0 && recipes > 0); // themed combinations still occasionally occur
+
+    // With both games' resources ready, sample the actual delivered classes.
+    // Stop the timer while each queue drains so one event is counted once.
+    g_precacheOpforWeapons = true;
+    StartWorld(dll, "c1a2", 1, true);
+    int commonDrops = 0, ofDrops = 0;
+    for (int n = 0; n < 800; ++n) {
+        RemoveSpawned(); g_edicts[1].v.health = 100; g_receivedItems.clear();
+        int id = WaitForAutomaticEvent(dll);
+        Mock_CVarSetFloat("chaos_enabled", 0); Step(dll, 3.0f);
+        if (IsWeaponDropEvent(id)) {
+            bool sawCommon = false, sawOf = false;
+            for (const std::string &item : g_receivedItems) {
+                for (int i = CHAOS_WEAPON_GIFT_START; i < CHAOS_OPFOR_WEAPON_GIFT_START; ++i)
+                    if (item == ChaosGetWeaponGift(i)->weapon) sawCommon = true;
+                for (int i = CHAOS_OPFOR_WEAPON_GIFT_START; i < CHAOS_EVENT_COUNT; ++i)
+                    if (item == ChaosGetWeaponGift(i)->weapon) sawOf = true;
+            }
+            if (id == 22) assert(sawCommon && !sawOf);
+            if (id == 42 || id >= CHAOS_OPFOR_WEAPON_GIFT_START) assert(sawOf && !sawCommon);
+            if (sawCommon) ++commonDrops;
+            if (sawOf) ++ofDrops;
+        }
+        g_allMessages.clear(); g_consoleOutput.clear();
+        Mock_CVarSetFloat("chaos_enabled", 1);
+    }
+    printf("    800 automatic events with OF available: HL weapon events=%d, OF weapon events=%d\n", commonDrops, ofDrops);
+    assert(commonDrops >= 160 && ofDrops >= 5 && commonDrops > ofDrops * 4);
+    g_precacheOpforWeapons = false;
+
+    // A map with only the world-precached snark must keep choosing it even
+    // when that ID is in recent history; its category cannot starve.
+    StartWorld(dll, "c1a2", 1, true, false);
+    int snarks = 0;
+    for (int n = 0; n < 160; ++n) {
+        RemoveSpawned(); g_edicts[1].v.health = 100;
+        int id = WaitForAutomaticEvent(dll);
+        if (id < 12) { assert(id == 8 && CountSpawned() == 3); ++snarks; }
+        Step(dll, 0.4f); g_allMessages.clear(); g_consoleOutput.clear();
+    }
+    assert(snarks >= 50);
+
+    // Explicitly disabling NPCs leaves other categories running normally.
+    Mock_CVarSetFloat("chaos_monsters", 0);
+    StartWorld(dll, "c1a2", 1, true);
+    weapons = 0;
+    for (int n = 0; n < 50; ++n) {
+        g_edicts[1].v.health = 100;
+        int id = WaitForAutomaticEvent(dll);
+        assert(id >= 12 && CountSpawned() == 0);
+        if (IsWeaponDropEvent(id)) ++weapons;
+        Step(dll, 0.4f); g_allMessages.clear(); g_consoleOutput.clear();
+    }
+    assert(weapons > 0);
+
+    // Missing classes are never spawned or advertised as weapon gifts; chaos
+    // falls back instead of stalling. Restore mock resource setup afterwards.
+    Mock_CVarSetFloat("chaos_monsters", 1);
+    g_precacheStockWeapons = false; g_precacheStockSnark = false;
+    StartWorld(dll, "c1a2", 1, true, false);
+    before = g_deathCounter.GetTotalEvents();
+    g_chaos.CmdTriggerById(CHAOS_WEAPON_GIFT_START);
+    assert(g_deathCounter.GetTotalEvents() == before);
+    for (int n = 0; n < 40; ++n) {
+        g_edicts[1].v.health = 100;
+        int id = WaitForAutomaticEvent(dll);
+        assert(id >= 12 && !IsWeaponDropEvent(id) && CountSpawned() == 0);
+        Step(dll, 0.4f); g_allMessages.clear(); g_consoleOutput.clear();
+    }
+    g_precacheStockWeapons = true; g_precacheStockSnark = true;
+
+    // Random weapon gift must choose from available classes, not silently
+    // pick an unavailable weapon on a reduced/OEM precache table.
+    Mock_CVarSetFloat("chaos_enabled", 0);
+    g_stockWeaponFilter = "weapon_9mmhandgun";
+    StartWorld(dll, "c1a2", 1, true, false);
+    g_receivedItems.clear();
+    g_chaos.CmdTriggerById(22); Step(dll, 1.6f);
+    assert(HasReceivedWeapon());
+    for (const std::string &item : g_receivedItems)
+        if (item.compare(0, 7, "weapon_") == 0) assert(item == "weapon_9mmhandgun");
+    g_stockWeaponFilter = nullptr;
+    // If no common HL class was prepared, event 22 must not stall.
+    g_precacheStockWeapons = false; g_precacheOpforWeapons = true;
+    StartWorld(dll, "c1a2", 1, true, false);
+    g_receivedItems.clear();
+    g_chaos.CmdTriggerById(22); Step(dll, 1.6f);
+    bool ofFallback = false;
+    for (int id = CHAOS_OPFOR_WEAPON_GIFT_START; id < CHAOS_EVENT_COUNT; ++id)
+        if (std::find(g_receivedItems.begin(), g_receivedItems.end(), ChaosGetWeaponGift(id)->weapon) != g_receivedItems.end()) ofFallback = true;
+    assert(ofFallback);
+    g_precacheStockWeapons = true; g_precacheOpforWeapons = false;
+    Mock_CVarSetFloat("chaos_enabled", 1);
+
+    // Before HEV, NPC and inventory spawns wait; other timed events continue.
+    StartWorld(dll, "c1a0", 1, false);
+    before = g_deathCounter.GetTotalEvents();
+    g_chaos.CmdTriggerById(0);
+    assert(g_deathCounter.GetTotalEvents() == before && CountSpawned() == 0);
+    for (int n = 0; n < 30; ++n) {
+        g_edicts[1].v.health = 100;
+        int id = WaitForAutomaticEvent(dll);
+        assert(id >= 12 && !IsWeaponDropEvent(id) && CountSpawned() == 0);
+        Step(dll, 0.4f); g_allMessages.clear(); g_consoleOutput.clear();
+    }
+    Mock_CVarSetFloat("chaos_interval", 10);
+    Mock_CVarSetFloat("chaos_enabled", 0);
 }
 
 int main() {
@@ -706,8 +1383,10 @@ int main() {
     dllTable.pfnSave     = Orig_Save;
     dllTable.pfnTouch    = Orig_Touch;
     dllTable.pfnUse      = Orig_Use;
+    dllTable.pfnClientCommand = Orig_ClientCommand;
     dllTable.pfnPlayerPreThink = Orig_PlayerPreThink;
     dllTable.pfnPlayerPostThink = Orig_PlayerPostThink;
+    dllTable.pfnPM_Move = Orig_PlayerMove;
 
     int ifaceVer = INTERFACE_VERSION;
     int ok = GetEntityAPI2(&dllTable, &ifaceVer);
@@ -715,23 +1394,35 @@ int main() {
 
     dllTable.pfnGameInit();
     assert(g_serverCommands.size() == 1 && g_serverCommands[0] == "exec chaos.cfg\n");
+    assert(Mock_CVarGetFloat("chaos_monsters") == 1 && "NPC events should be enabled by default");
     StartWorld(dllTable, "c1a2", 1.0f, true, true, false);
     assert(g_serverCommands.size() == 1); // no repeated exec on ServerActivate
+    TestRestoreAndDisconnectLifecycle(dllTable);
+    StartWorld(dllTable, "c1a2", 1.0f, true, true, false);
 
-    printf("[1] 477 event definitions and unique recipe IDs...\n");
-    assert(g_chaos.GetEventCount() == 477);
+    printf("[1] 500 event definitions, 23 weapon gifts and unique recipes...\n");
+    assert(g_chaos.GetEventCount() == 500);
     std::set<std::string> recipeTitles;
     for (int i = 0; i < g_chaos.GetEventCount(); ++i) {
         const ChaosEventDef *ev = g_chaos.GetEventDef(i);
         assert(ev && ev->id == i && ev->titleEn && *ev->titleEn && ev->titleRu && *ev->titleRu && ev->descRu && *ev->descRu);
-        if ((i >= CHAOS_RECIPE_START && i < CHAOS_RECIPE_END) || i >= CHAOS_EXTENSION_START)
+        if ((i >= CHAOS_RECIPE_START && i < CHAOS_RECIPE_END) ||
+            (i >= CHAOS_EXTENSION_START && i < CHAOS_EXTENSION_END))
             assert(recipeTitles.insert(ev->titleEn).second);
     }
     assert(recipeTitles.size() == 432);
     assert(ChaosRecipeTheme(428) == -1 && ChaosRecipeVariant(428) == -1);
     assert(ChaosRecipeTheme(429) == 0 && ChaosRecipeVariant(429) == 16);
     assert(ChaosRecipeTheme(476) == 23 && ChaosRecipeVariant(476) == 17);
-    assert(!g_chaos.GetEventDef(-1) && !g_chaos.GetEventDef(477));
+    assert(ChaosRecipeTheme(477) == -1 && ChaosRecipeVariant(477) == -1);
+    const int awpRecipe = CHAOS_RECIPE_START + 15 * CHAOS_VARIANT_COUNT;
+    assert(!ChaosRecipeAllowedAutomatically(awpRecipe + 8, false));
+    assert(!ChaosRecipeAllowedAutomatically(awpRecipe + 9, false));
+    assert(ChaosRecipeAllowedAutomatically(awpRecipe + 10, false));
+    assert(!ChaosRecipeAllowedAutomatically(awpRecipe + 10, true));
+    assert(!ChaosRecipeAllowedAutomatically(477, false));
+    assert(ChaosGetWeaponGift(477) && ChaosGetWeaponGift(490) && ChaosGetWeaponGift(491) && ChaosGetWeaponGift(499) && !ChaosGetWeaponGift(476));
+    assert(!g_chaos.GetEventDef(-1) && !g_chaos.GetEventDef(500));
 
     printf("[2] Automatic timer, bounded HUD and strict command parsing...\n");
     int before = g_deathCounter.GetTotalEvents();
@@ -888,7 +1579,13 @@ int main() {
     assert(g_emittedSounds == soundBefore);
     g_precacheCues = true;
 
-    printf("[4] Exercise all 477 events and expire every modifier...\n");
+    TestBombSearchAndBlast(dllTable);
+    TestNpcWeaponPriority(dllTable);
+    TestOpforWeaponDelivery(dllTable);
+    TestHeldJumpAndMomentum(dllTable);
+    TestHudColorLifecycle(dllTable);
+
+    printf("[4] Exercise all 500 events and expire every modifier...\n");
     StartWorld(dllTable, "c1a2", 10, true);
     Mock_CVarSetFloat("chaos_enabled", 0);
     g_receivedItems.clear();
@@ -902,6 +1599,7 @@ int main() {
     int allocationsAfterFirstArsenal = g_allocStringCalls;
     g_chaos.CmdTriggerById(23); Step(dllTable, 6);
     assert(g_allocStringCalls == allocationsAfterFirstArsenal && "runtime class IDs must be reused on a map");
+    g_precacheOpforWeapons = true;
     StartWorld(dllTable, "c1a2", 100, true);
     Mock_CVarSetFloat("chaos_enabled", 0);
     Mock_CVarSetFloat("chaos_monsters", 1);
@@ -923,6 +1621,7 @@ int main() {
         assert(CountSpawned() <= 8);
     }
     // The appended combinations have concrete behavior, not just new names.
+    g_precacheOpforWeapons = false;
     StartWorld(dllTable, "c1a2", 1, true); Mock_CVarSetFloat("chaos_enabled", 0);
     g_chaos.CmdTriggerById(429); assert(g_edicts[1].v.maxspeed == 520); // TOTEM + B-HOP
     Step(dllTable, 0.4f); g_edicts[1].v.health = 20; g_edicts[1].v.armorvalue = 0;

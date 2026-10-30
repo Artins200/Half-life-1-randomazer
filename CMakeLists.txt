@@ -46,6 +46,10 @@ endif()
 
 target_include_directories(hl PRIVATE include src)
 
+# Optional installer reads locally installed Valve/Gearbox HUD sprites only.
+add_executable(install_hev_hud tools/install_hev_hud.cpp)
+target_compile_definitions(install_hev_hud PRIVATE _CRT_SECURE_NO_WARNINGS)
+
 option(BUILD_CHAOS_TESTS "Build standalone GoldSrc chaos simulation test" ON)
 if(BUILD_CHAOS_TESTS)
     enable_testing()
@@ -60,6 +64,11 @@ if(BUILD_CHAOS_TESTS)
     endif()
     add_test(NAME chaos_simulation COMMAND test_chaos_simulation)
     find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME opfor_client_setup COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_opfor_setup.py)
+        add_test(NAME hev_hud_setup COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/tests/test_hev_hud_setup.py $<TARGET_FILE:install_hev_hud>)
+    endif()
     if(Python3_Interpreter_FOUND AND NOT WIN32)
         add_test(NAME linux_proxy_loader COMMAND ${CMAKE_COMMAND} -E env
             "CXX=${CMAKE_CXX_COMPILER}" ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_bridge_loader.py)

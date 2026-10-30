@@ -1,4 +1,5 @@
 #include "chaos_events.h"
+#include "hlsdk_pmove.h"
 #include "death_counter.h"
 #include <stdio.h>
 #include <string.h>
@@ -20,7 +21,12 @@ static const char *const kTrackedClasses[] = {
     "weapon_9mmAR", "weapon_crossbow", "weapon_rpg", "weapon_gauss", "weapon_egon",
     "weapon_hornetgun", "weapon_handgrenade", "weapon_satchel", "weapon_tripmine", "weapon_snark",
     "ammo_9mmclip", "ammo_357", "ammo_buckshot", "ammo_9mmAR", "ammo_ARgrenades",
-    "ammo_crossbow", "ammo_rpgclip", "ammo_gaussclip", "player_weaponstrip"
+    "ammo_crossbow", "ammo_rpgclip", "ammo_gaussclip", "player_weaponstrip",
+    // Actual Opposing Force classes. Observed only if the loaded DLL/map
+    // prepared them during map loading; never precache additional resources.
+    "weapon_pipewrench", "weapon_knife", "weapon_grapple", "weapon_eagle", "weapon_m249",
+    "weapon_sniperrifle", "weapon_sporelauncher", "weapon_shockrifle", "weapon_displacer",
+    "ammo_556", "ammo_762", "ammo_spore"
 };
 static const char *const kCueSounds[] = {
     "fvox/beep.wav", "debris/beamstart7.wav", "items/suitchargeok1.wav",
@@ -119,11 +125,17 @@ ChaosManager::ChaosManager()
       m_msgScreenFade(0),
       m_msgSayText(0),
       m_msgTextMsg(0),
+      m_msgHudColor(0),
+      m_hudColorApplied(-1),
+      m_nextHudColorTime(0.0f),
       m_inWorldPrecache(false),
       m_pEdictList(nullptr),
       m_edictCount(0),
       m_clientMax(1),
       m_serverActive(false),
+      m_networkPlayer(nullptr),
+      m_networkPlayerIndex(0),
+      m_networkPlayerSerial(0),
       m_restrictedContext(false),
       m_flLastFrameTime(0.0f),
       m_flNextChaosTime(10.0f),
@@ -190,9 +202,12 @@ ChaosManager::ChaosManager()
     m_cvarInterval = { "chaos_interval", "10", FCVAR_SERVER | FCVAR_ARCHIVE, 10.0f, nullptr };
     m_cvarSound    = { "chaos_sound",    "1",  FCVAR_SERVER | FCVAR_ARCHIVE, 1.0f,  nullptr };
     m_cvarRuChat   = { "chaos_ru_chat",  "1",  FCVAR_SERVER | FCVAR_ARCHIVE, 1.0f,  nullptr };
-    m_cvarMonsters = { "chaos_monsters", "0", FCVAR_SERVER | FCVAR_ARCHIVE, 0.0f, nullptr };
+    m_cvarMonsters = { "chaos_monsters", "1", FCVAR_SERVER | FCVAR_ARCHIVE, 1.0f, nullptr };
     m_cvarSpawnLimit = { "chaos_spawn_limit", "8", FCVAR_SERVER | FCVAR_ARCHIVE, 8.0f, nullptr };
     m_cvarIntroTroll = { "chaos_intro_troll", "1", FCVAR_SERVER | FCVAR_ARCHIVE, 1.0f, nullptr };
+    m_cvarAutoJump = { "chaos_autojump", "1", FCVAR_SERVER | FCVAR_ARCHIVE, 1.0f, nullptr };
+    m_cvarUncapBhop = { "chaos_bhop_nocap", "1", FCVAR_SERVER | FCVAR_ARCHIVE, 1.0f, nullptr };
+    m_cvarHevHud = { "chaos_hev_hud", "1", FCVAR_SERVER | FCVAR_ARCHIVE, 1.0f, nullptr };
     memset(m_classReady, 0, sizeof(m_classReady));
     memset(m_classStringIds, 0, sizeof(m_classStringIds));
     memset(m_soundReady, 0, sizeof(m_soundReady));
@@ -237,6 +252,9 @@ void ChaosManager::RegisterCvarsAndCommands() {
         g_engfuncs.pfnCVarRegister(&m_cvarMonsters);
         g_engfuncs.pfnCVarRegister(&m_cvarSpawnLimit);
         g_engfuncs.pfnCVarRegister(&m_cvarIntroTroll);
+        g_engfuncs.pfnCVarRegister(&m_cvarAutoJump);
+        g_engfuncs.pfnCVarRegister(&m_cvarUncapBhop);
+        g_engfuncs.pfnCVarRegister(&m_cvarHevHud);
     }
     if (g_engfuncs.pfnAddServerCommand) {
         g_engfuncs.pfnAddServerCommand((char *)"chaos_now", SrvCmd_ChaosNow);
@@ -263,17 +281,22 @@ void ChaosManager::RegisterCvarsAndCommands() {
     if (g_engfuncs.pfnServerCommand) g_engfuncs.pfnServerCommand((char *)"exec chaos.cfg\n");
 }
 
-void ChaosManager::OnRegUserMsg(const char *pszName, int iMsgId) {
+void ChaosManager::OnRegUserMsg(const char *pszName, int iMsgId, int size) {
     if (!pszName || iMsgId <= 0) return;
     if (strcmp(pszName, "SetFOV") == 0)          m_msgSetFOV = iMsgId;
     else if (strcmp(pszName, "ScreenShake") == 0) m_msgScreenShake = iMsgId;
     else if (strcmp(pszName, "ScreenFade") == 0)  m_msgScreenFade = iMsgId;
     else if (strcmp(pszName, "SayText") == 0)     m_msgSayText = iMsgId;
     else if (strcmp(pszName, "TextMsg") == 0)     m_msgTextMsg = iMsgId;
+    else if (strcmp(pszName, "HudColor") == 0)   m_msgHudColor = (size == 3) ? iMsgId : 0;
 }
 
 void ChaosManager::OnMapPrecacheReset() {
-    if (m_serverActive) ClearAllModifiers(FindActivePlayer(), true);
+    // The previous map's client channel/edicts may already have been freed.
+    // Restore global cvars without dereferencing or messaging the old player.
+    m_networkPlayer = nullptr;
+    m_networkPlayerIndex = 0;
+    if (m_serverActive) ClearAllModifiers(nullptr, true);
     memset(m_classReady, 0, sizeof(m_classReady));
     // Engine-allocated string IDs are only valid for the map that allocated them.
     memset(m_classStringIds, 0, sizeof(m_classStringIds));
@@ -285,9 +308,12 @@ void ChaosManager::OnWorldPrecacheBegin() { m_inWorldPrecache = true; }
 void ChaosManager::OnWorldPrecacheEnd() { m_inWorldPrecache = false; }
 
 void ChaosManager::OnWorldEntityCreated(int classname, edict_t *entity) {
+    // The engine's string_t is a 32-bit unsigned offset, even though
+    // pfnCreateNamedEntity takes int. MAKE_STRING of a DLL literal may set
+    // the high bit, so a negative int is valid; only zero is the null string.
     if (!m_inWorldPrecache || !entity || entity->free || !entity->pvPrivateData ||
-        !gpGlobals || !gpGlobals->pStringBase || classname <= 0) return;
-    const char *name = STRING(classname);
+        !gpGlobals || !gpGlobals->pStringBase || classname == 0) return;
+    const char *name = STRING((string_t)classname);
     // Valve's W_Precache precaches these stock items/weapons and snarks.
     if (strncmp(name, "weapon_", 7) && strncmp(name, "ammo_", 5) &&
         strcmp(name, "item_suit") && strcmp(name, "item_battery") &&
@@ -326,6 +352,9 @@ void ChaosManager::OnServerActivate(edict_t *pEdictList, int edictCount, int cli
     m_edictCount = edictCount;
     m_clientMax = (clientMax > 0) ? clientMax : 1;
     m_serverActive = true;
+    m_networkPlayer = nullptr;
+    m_networkPlayerIndex = 0;
+    m_networkPlayerSerial = 0;
 
     const char *mapName = (gpGlobals && gpGlobals->mapname) ? STRING(gpGlobals->mapname) : "";
     ResetTransientState();
@@ -367,39 +396,46 @@ void ChaosManager::OnServerActivate(edict_t *pEdictList, int edictCount, int cli
 }
 
 void ChaosManager::OnServerDeactivate() {
-    ClearAllModifiers(FindActivePlayer(), true);
+    // During load/restart the client can already be disconnected here. Even
+    // SetFOV while clearing a modifier would write to a zeroed sizebuf_t.
+    m_networkPlayer = nullptr;
+    m_networkPlayerIndex = 0;
+    ClearAllModifiers(nullptr, true);
     ResetTransientState();
     g_deathCounter.FlushNow();
     m_serverActive = false;
 }
 
 void ChaosManager::OnClientPutInServer(edict_t *pPlayer) {
+    (void)pPlayer;
     g_deathCounter.OnClientPutInServer();
-    ClearAllModifiers(pPlayer, true);
+    m_networkPlayer = nullptr;
+    m_networkPlayerIndex = 0;
+    ClearAllModifiers(nullptr, true);
     m_restrictedContext = false;
+    // ClientPutInServer happens during signon, before it completes; wait for
+    // the first real player PreThink before sending HUD or starting events.
+}
 
-    float interval = ChaosInterval();
-
-    if (gpGlobals) {
-        m_flNextChaosTime = gpGlobals->time + interval;
-        m_flNextHudRefresh = gpGlobals->time + 0.25f;
+void ChaosManager::OnClientDisconnect(edict_t *pPlayer) {
+    if (pPlayer && pPlayer == m_networkPlayer) {
+        m_networkPlayer = nullptr;
+        m_networkPlayerIndex = 0;
+        ClearAllModifiers(nullptr, true);
+        ResetTransientState();
     }
-    m_lastBeepSecond = -1;
 }
 
 edict_t *ChaosManager::FindActivePlayer() const {
-    if (!m_serverActive || !g_engfuncs.pfnPEntityOfEntIndex) {
-        return nullptr;
-    }
-    int maxCli = (gpGlobals && gpGlobals->maxClients > 0) ? gpGlobals->maxClients : m_clientMax;
-    if (maxCli < 1) maxCli = 1;
-    for (int i = 1; i <= maxCli; ++i) {
-        edict_t *pEnt = g_engfuncs.pfnPEntityOfEntIndex(i);
-        if (pEnt && !pEnt->free && (pEnt->v.flags & FL_CLIENT)) {
-            return pEnt;
-        }
-    }
-    return nullptr;
+    if (!m_serverActive || !m_networkPlayer || m_networkPlayerIndex <= 0 ||
+        !g_engfuncs.pfnPEntityOfEntIndex) return nullptr;
+    const int slots = (gpGlobals && gpGlobals->maxClients > 0) ? gpGlobals->maxClients : m_clientMax;
+    if (slots < 1 || slots > 64 || m_networkPlayerIndex > slots ||
+        (gpGlobals && gpGlobals->maxEntities > 0 && m_networkPlayerIndex >= gpGlobals->maxEntities)) return nullptr;
+    edict_t *ent = g_engfuncs.pfnPEntityOfEntIndex(m_networkPlayerIndex);
+    if (ent != m_networkPlayer || !ent || ent->free || ent->serialnumber != m_networkPlayerSerial ||
+        !(ent->v.flags & FL_CLIENT) || (ent->v.flags & FL_FAKECLIENT)) return nullptr;
+    return ent;
 }
 
 bool ChaosManager::IsIntroTramMap() const {
@@ -423,7 +459,7 @@ bool ChaosManager::IsMovementSafe(const edict_t *player) const {
 bool ChaosManager::IsChaosSessionAvailable(const edict_t *player) const {
     if (!m_serverActive || !gpGlobals || !gpGlobals->pStringBase ||
         gpGlobals->deathmatch != 0.0f || gpGlobals->coop != 0.0f ||
-        !player || player->free || !(player->v.flags & FL_CLIENT) ||
+        !player || player != FindActivePlayer() || player->free || !(player->v.flags & FL_CLIENT) ||
         player->v.deadflag != DEAD_NO || player->v.health <= 0.0f) return false;
 
     // maxClients is a slot capacity, not a player count. A local game with
@@ -463,6 +499,23 @@ bool ChaosManager::IsEventAllowed(const edict_t *player, int eventId) const {
     return IsChaosSessionAvailable(player) && IsEventAllowedInSession(player, eventId);
 }
 
+bool ChaosManager::HasReadyWeaponForEvent(int eventId) const {
+    if (const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(eventId)) return IsClassReady(gift->weapon);
+    if (eventId == 42) {
+        for (int i = 0; i < CHAOS_OPFOR_WEAPON_GIFT_COUNT; ++i) {
+            const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(CHAOS_OPFOR_WEAPON_GIFT_START + i);
+            if (gift && IsClassReady(gift->weapon)) return true;
+        }
+        return IsClassReady("weapon_9mmAR") || IsClassReady("weapon_shotgun") || IsClassReady("weapon_gauss");
+    }
+    if (eventId != 22 && eventId != 23) return false;
+    for (int i = 0; i < CHAOS_WEAPON_GIFT_COUNT; ++i) {
+        const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(CHAOS_WEAPON_GIFT_START + i);
+        if (gift && IsClassReady(gift->weapon)) return true;
+    }
+    return false;
+}
+
 bool ChaosManager::IsEventAllowedInSession(const edict_t *player, int eventId) const {
     const ChaosEventDef *ev = ChaosGetEventDef(eventId);
     if (!ev) return false;
@@ -474,10 +527,19 @@ bool ChaosManager::IsEventAllowedInSession(const edict_t *player, int eventId) c
             "monster_zombie", "monster_alien_slave", "monster_human_grunt", "monster_alien_grunt",
             "monster_snark", "monster_cockroach", "monster_barney", "monster_scientist"
         };
-        if (!g_engfuncs.pfnCVarGetFloat || g_engfuncs.pfnCVarGetFloat("chaos_monsters") <= 0.0f ||
-            !IsClassReady(classes[eventId]) || !HasEntityHeadroom()) return false;
+        if (!g_engfuncs.pfnCVarGetFloat || !g_engfuncs.pfnAllocString || !g_engfuncs.pfnCreateNamedEntity ||
+            !g_engfuncs.pfnRemoveEntity || !g_engfuncs.pfnTraceLine || !g_engfuncs.pfnTraceHull ||
+            !g_engfuncs.pfnPointContents || !g_origDllFuncs.pfnSpawn || !IsClassReady(classes[eventId]) ||
+            !HasEntityHeadroom()) return false;
+        float monstersEnabled = g_engfuncs.pfnCVarGetFloat("chaos_monsters");
+        if (!isfinite(monstersEnabled) || monstersEnabled <= 0.0f) return false;
         float limit = g_engfuncs.pfnCVarGetFloat("chaos_spawn_limit");
         if (!isfinite(limit) || limit <= 0 || CountChaosEntities() >= (int)(limit < 16 ? limit : 16)) return false;
+    }
+    if (eventId == 22 || eventId == 23 || eventId == 42 || ChaosGetWeaponGift(eventId)) {
+        if (!HasReadyWeaponForEvent(eventId) || !HasEntityHeadroom() || !g_engfuncs.pfnAllocString ||
+            !g_engfuncs.pfnCreateNamedEntity || !g_engfuncs.pfnRemoveEntity ||
+            !g_origDllFuncs.pfnSpawn || !g_origDllFuncs.pfnTouch) return false;
     }
     return true;
 }
@@ -672,41 +734,91 @@ uint32_t static NextXorShift(uint32_t &state) {
     return x;
 }
 
+int ChaosManager::PickRandomIndex(int count) {
+    if (count <= 0) return 0;
+    uint32_t r = NextXorShift(m_rngState);
+    if (g_engfuncs.pfnRandomLong) r ^= (uint32_t)g_engfuncs.pfnRandomLong(0, 100000);
+    return (int)(r % (uint32_t)count);
+}
+
+enum AutomaticEventPool { AUTO_NPC, AUTO_WEAPON_COMMON, AUTO_WEAPON_RARE, AUTO_OTHER, AUTO_RECIPE, AUTO_POOL_COUNT };
+
+static bool IsRareWeaponGift(int id) {
+    // HL1's explosive/alien weapons and every OF gift are deliberately rare.
+    return ChaosGetWeaponGift(id) && id >= CHAOS_WEAPON_GIFT_START + 6;
+}
+
+static AutomaticEventPool AutomaticPoolFor(int id) {
+    if (id >= 0 && id < 12) return AUTO_NPC;
+    if (id == 23 || id == 42 || IsRareWeaponGift(id)) return AUTO_WEAPON_RARE;
+    if (id == 22 || ChaosGetWeaponGift(id)) return AUTO_WEAPON_COMMON;
+    if ((id >= CHAOS_RECIPE_START && id < CHAOS_RECIPE_END) ||
+        (id >= CHAOS_EXTENSION_START && id < CHAOS_EXTENSION_END)) return AUTO_RECIPE;
+    return AUTO_OTHER;
+}
+
 int ChaosManager::PickNextEventId(const edict_t *pPlayer) {
     if (!IsChaosSessionAvailable(pPlayer)) return -1;
-    int candidates[CHAOS_EVENT_COUNT];
+    struct Candidate { int id; AutomaticEventPool pool; bool recent; };
+    Candidate candidates[CHAOS_EVENT_COUNT];
     int candidateCount = 0;
-
-    // The session/client count is stable for this synchronous selection; do
-    // not rescan every player slot once per catalog entry.
-    for (int pass = 0; pass < 2 && candidateCount == 0; ++pass) {
-        for (int i = 0; i < CHAOS_EVENT_COUNT; ++i) {
-            if (!IsEventAllowedInSession(pPlayer, i)) continue;
-
-            if (pass == 0) {
-                bool recentlyUsed = false;
-                for (int h = 0; h < CHAOS_HISTORY_SIZE; ++h) {
-                    if (m_recentEvents[h] == i) {
-                        recentlyUsed = true;
-                        break;
-                    }
-                }
-                if (recentlyUsed) continue;
-            }
-            candidates[candidateCount++] = i;
+    int counts[AUTO_POOL_COUNT] = {};
+    int freshCounts[AUTO_POOL_COUNT] = {};
+    // Select a category first, then an ID. 432 recipes must not outweigh all
+    // standalone NPCs simply because there are more combinations in the list.
+    int weights[AUTO_POOL_COUNT] = {50, 31, 4, 10, 5};
+    const bool restricted = IsRestrictedState(pPlayer);
+    for (int i = 0; i < CHAOS_EVENT_COUNT; ++i) {
+        if (!IsEventAllowedInSession(pPlayer, i)) continue;
+        AutomaticEventPool pool = AutomaticPoolFor(i);
+        if ((pool == AUTO_WEAPON_COMMON || pool == AUTO_WEAPON_RARE) && m_itemQueueCount > 0) continue;
+        if (pool == AUTO_RECIPE) {
+            // Intro/cutscenes get standalone visual events only. The two AWP
+            // combinations that immediately overwrite their own FOV are
+            // manual-only; the remaining recipes stay eligible at low weight.
+            if (!ChaosRecipeAllowedAutomatically(i, restricted)) continue;
         }
+        bool recent = false;
+        for (int h = 0; h < CHAOS_HISTORY_SIZE; ++h) {
+            if (m_recentEvents[h] == i) { recent = true; break; }
+        }
+        candidates[candidateCount++] = {i, pool, recent};
+        ++counts[pool];
+        if (!recent) ++freshCounts[pool];
     }
 
-    if (candidateCount <= 0) {
-        return -1; // No safe event on this map/player state.
-    }
+    // If no rare class is prepared, retain the 35% overall weapon weight.
+    if (!counts[AUTO_WEAPON_RARE] && counts[AUTO_WEAPON_COMMON])
+        weights[AUTO_WEAPON_COMMON] += weights[AUTO_WEAPON_RARE];
+    int totalWeight = 0;
+    for (int p = 0; p < AUTO_POOL_COUNT; ++p) if (counts[p]) totalWeight += weights[p];
+    if (!totalWeight) return -1;
 
     uint32_t r = NextXorShift(m_rngState);
-    if (g_engfuncs.pfnRandomLong) {
-        r ^= (uint32_t)g_engfuncs.pfnRandomLong(0, 100000);
+    if (g_engfuncs.pfnRandomLong) r ^= (uint32_t)g_engfuncs.pfnRandomLong(0, 100000);
+    int ticket = (int)(r % (uint32_t)totalWeight);
+    int selectedPool = 0;
+    for (; selectedPool < AUTO_POOL_COUNT; ++selectedPool) {
+        if (!counts[selectedPool]) continue;
+        if (ticket < weights[selectedPool]) break;
+        ticket -= weights[selectedPool];
     }
-    int chosen = candidates[r % (uint32_t)candidateCount];
+    if (selectedPool == AUTO_POOL_COUNT) return -1;
 
+    // History is relaxed independently for each category. If, for example,
+    // snarks are the only prepared NPC, they must not disappear for eight
+    // events merely because other categories have fresh IDs available.
+    const bool requireFresh = freshCounts[selectedPool] > 0;
+    const int poolCount = requireFresh ? freshCounts[selectedPool] : counts[selectedPool];
+    r = NextXorShift(m_rngState);
+    if (g_engfuncs.pfnRandomLong) r ^= (uint32_t)g_engfuncs.pfnRandomLong(0, 100000);
+    int chosenIndex = (int)(r % (uint32_t)poolCount);
+    int chosen = -1;
+    for (int i = 0; i < candidateCount; ++i) {
+        if ((int)candidates[i].pool != selectedPool || (requireFresh && candidates[i].recent)) continue;
+        if (chosenIndex-- == 0) { chosen = candidates[i].id; break; }
+    }
+    if (chosen < 0) return -1;
     m_recentEvents[m_recentHead] = chosen;
     m_recentHead = (m_recentHead + 1) % CHAOS_HISTORY_SIZE;
     return chosen;
@@ -762,13 +874,19 @@ bool ChaosManager::FindSafeSpawnSpot(const edict_t *pPlayer, int hullType, float
         g_engfuncs.pfnTraceHull(candidate, downTarget, 0 /*dont_ignore_monsters*/, hullType, (edict_t *)pPlayer, &floorTr);
 
         if (floorTr.fAllSolid || floorTr.fStartSolid || floorTr.flFraction >= 1.0f) continue;
-        Vec3 finalSpot(floorTr.vecEndPos.x, floorTr.vecEndPos.y, floorTr.vecEndPos.z + 2.0f);
+        Vec3 hullCenter = floorTr.vecEndPos + Vec3(0, 0, 2.0f);
 
         TraceResult hullCheck;
         memset((void *)&hullCheck, 0, sizeof(hullCheck));
-        g_engfuncs.pfnTraceHull(finalSpot, finalSpot, 0 /*dont_ignore_monsters*/, hullType, (edict_t *)pPlayer, &hullCheck);
-        if (!hullCheck.fAllSolid && !hullCheck.fStartSolid) {
-            outPos = finalSpot;
+        g_engfuncs.pfnTraceHull(hullCenter, hullCenter, 0 /*dont_ignore_monsters*/, hullType, (edict_t *)pPlayer, &hullCheck);
+        // GoldSrc TraceHull is centered vertically, while the stock monster
+        // classes use a bottom-at-origin bounding box. Align the validated
+        // hull to the actual NPC, rather than placing its feet at the center.
+        const float halfHeight = hullType == large_hull ? 32.0f : (hullType == head_hull ? 18.0f : 36.0f);
+        Vec3 monsterOrigin = hullCenter - Vec3(0, 0, halfHeight);
+        if (!hullCheck.fAllSolid && !hullCheck.fStartSolid &&
+            g_engfuncs.pfnPointContents(monsterOrigin + Vec3(0, 0, 1)) == CONTENTS_EMPTY) {
+            outPos = monsterOrigin;
             return true;
         }
     }
@@ -778,8 +896,10 @@ bool ChaosManager::FindSafeSpawnSpot(const edict_t *pPlayer, int hullType, float
 
 int ChaosManager::SpawnMonstersAroundPlayer(edict_t *pPlayer, const char *classname, int count, int hullType, bool friendly) {
     if (!pPlayer || !classname || !IsClassReady(classname) || !g_engfuncs.pfnAllocString ||
-        !g_engfuncs.pfnCreateNamedEntity || !g_origDllFuncs.pfnSpawn || !g_engfuncs.pfnCVarGetFloat ||
-        g_engfuncs.pfnCVarGetFloat("chaos_monsters") <= 0.0f) return 0;
+        !g_engfuncs.pfnCreateNamedEntity || !g_engfuncs.pfnRemoveEntity || !g_origDllFuncs.pfnSpawn ||
+        !g_engfuncs.pfnCVarGetFloat) return 0;
+    float monstersEnabled = g_engfuncs.pfnCVarGetFloat("chaos_monsters");
+    if (!isfinite(monstersEnabled) || monstersEnabled <= 0.0f) return 0;
     float configured = g_engfuncs.pfnCVarGetFloat("chaos_spawn_limit");
     if (!isfinite(configured) || configured <= 0) return 0;
     int limit = (int)(configured < 16 ? configured : 16);
@@ -809,6 +929,9 @@ int ChaosManager::SpawnMonstersAroundPlayer(edict_t *pPlayer, const char *classn
         pent->v.origin = spawnPos;
         pent->v.angles = Vec3(0.0f, yaw, 0.0f);
         pent->v.iuser4 = 0xC4A05; // Mark as Chaos-spawned entity
+        // Let the original NPC AI fade its own corpse; otherwise a few dead
+        // chaos NPCs could permanently exhaust the per-map spawn limit.
+        pent->v.spawnflags |= SF_MONSTER_FADECORPSE;
 
         int spawnResult = g_origDllFuncs.pfnSpawn(pent);
         if (spawnResult < 0 && !pent->free && g_engfuncs.pfnRemoveEntity) g_engfuncs.pfnRemoveEntity(pent);
@@ -833,7 +956,7 @@ int ChaosManager::SpawnMonstersAroundPlayer(edict_t *pPlayer, const char *classn
 
 void ChaosManager::GiveItemToPlayer(edict_t *pPlayer, const char *itemClassname) {
     if (!pPlayer || !itemClassname || !IsClassReady(itemClassname) || !HasEntityHeadroom() ||
-        !g_engfuncs.pfnAllocString || !g_engfuncs.pfnCreateNamedEntity ||
+        !g_engfuncs.pfnAllocString || !g_engfuncs.pfnCreateNamedEntity || !g_engfuncs.pfnRemoveEntity ||
         !g_origDllFuncs.pfnSpawn || !g_origDllFuncs.pfnTouch) {
         return;
     }
@@ -880,7 +1003,12 @@ void ChaosManager::QueueItemToPlayer(edict_t *player, const char *classname) {
 }
 void ChaosManager::UpdateItemQueue(edict_t *player) {
     if (!gpGlobals || !player || !m_itemQueueCount || gpGlobals->time < m_nextItemTick) return;
-    if (!IsEventAllowed(player, 23)) { ClearItemQueue(); return; }
+    // A queue may contain supplies as well as weapons; do not depend on the
+    // availability of the full-arsenal event to finish processing it.
+    if (!IsChaosSessionAvailable(player) || IsRestrictedState(player) || !PlayerHasSuit(player)) {
+        ClearItemQueue();
+        return;
+    }
     m_nextItemTick = gpGlobals->time + 0.25f;
     for (int i = 0; i < 2 && m_itemQueueCount > 0; ++i) {
         char item[32];
@@ -916,15 +1044,22 @@ void ChaosManager::StripPlayerWeapons(edict_t *pPlayer) {
     }
 }
 
-int ChaosManager::LaunchNearbyEnemies(edict_t *pPlayer, float radius, float upwardVel) {
-    if (!pPlayer || !g_engfuncs.pfnFindEntityInSphere) {
-        return 0;
-    }
+int ChaosManager::LaunchNearbyEnemies(edict_t *pPlayer, const Vec3 &center, float radius, float upwardVel) {
+    if (!pPlayer || !gpGlobals || gpGlobals->maxEntities <= 0 || !g_engfuncs.pfnFindEntityInSphere ||
+        (!g_engfuncs.pfnEntOffsetOfPEntity && !g_engfuncs.pfnIndexOfEdict)) return 0;
 
     int count = 0;
     edict_t *ent = nullptr;
-    while ((ent = g_engfuncs.pfnFindEntityInSphere(ent, pPlayer->v.origin, radius)) != nullptr) {
-        if (ent == pPlayer || ent->free) continue;
+    int maxScans = gpGlobals->maxEntities;
+    if (maxScans > 4096) maxScans = 4096;
+    for (int scanned = 0; scanned < maxScans; ++scanned) {
+        edict_t *next = g_engfuncs.pfnFindEntityInSphere(ent, center, radius);
+        // GoldSrc signals end-of-search with edict 0 (worldspawn), not NULL.
+        // Searching again from that sentinel restarts at the beginning forever.
+        if (FNullEnt(next) || (g_engfuncs.pfnIndexOfEdict && g_engfuncs.pfnIndexOfEdict(next) == 0) ||
+            next == ent) break;
+        ent = next;
+        if (ent == pPlayer) continue;
         if (!(ent->v.flags & FL_MONSTER) || ent->v.movetype != MOVETYPE_STEP) continue;
         if (ent->v.deadflag != DEAD_NO || ent->v.health <= 0.0f) continue;
 
@@ -951,7 +1086,7 @@ int ChaosManager::LaunchNearbyEnemies(edict_t *pPlayer, float radius, float upwa
 }
 
 void ChaosManager::PlayCueSound(edict_t *pPlayer, const char *sample, int pitch) {
-    if (!pPlayer || !sample || !IsCueReady(sample) || !g_engfuncs.pfnEmitSound) return;
+    if (!pPlayer || pPlayer != FindActivePlayer() || !sample || !IsCueReady(sample) || !g_engfuncs.pfnEmitSound) return;
     if (g_engfuncs.pfnCVarGetFloat && g_engfuncs.pfnCVarGetFloat("chaos_sound") <= 0.0f) {
         return;
     }
@@ -959,7 +1094,7 @@ void ChaosManager::PlayCueSound(edict_t *pPlayer, const char *sample, int pitch)
 }
 
 void ChaosManager::SendHudText(edict_t *pPlayer, const hudtextparms_t &parms, const char *message, bool reliable) {
-    if (!pPlayer || !message || !g_engfuncs.pfnMessageBegin) return;
+    if (!pPlayer || pPlayer != FindActivePlayer() || !message || !g_engfuncs.pfnMessageBegin) return;
 
     const int dest = reliable ? MSG_ONE : MSG_ONE_UNRELIABLE;
     g_engfuncs.pfnMessageBegin(dest, SVC_TEMPENTITY, nullptr, pPlayer);
@@ -994,7 +1129,7 @@ void ChaosManager::SendHudText(edict_t *pPlayer, const hudtextparms_t &parms, co
 }
 
 void ChaosManager::SendScreenShake(edict_t *pPlayer, float amplitude, float frequency, float duration) {
-    if (!pPlayer || m_msgScreenShake <= 0 || !g_engfuncs.pfnMessageBegin) return;
+    if (!pPlayer || pPlayer != FindActivePlayer() || m_msgScreenShake <= 0 || !g_engfuncs.pfnMessageBegin) return;
     g_engfuncs.pfnMessageBegin(MSG_ONE_UNRELIABLE, m_msgScreenShake, nullptr, pPlayer);
     g_engfuncs.pfnWriteShort(FixedUnsigned16(amplitude, (float)(1 << 12)));
     g_engfuncs.pfnWriteShort(FixedUnsigned16(duration, (float)(1 << 12)));
@@ -1003,7 +1138,7 @@ void ChaosManager::SendScreenShake(edict_t *pPlayer, float amplitude, float freq
 }
 
 void ChaosManager::SendScreenFade(edict_t *pPlayer, byte r, byte g, byte b, byte alpha, float fadeTime, float holdTime, int flags) {
-    if (!pPlayer || m_msgScreenFade <= 0 || !g_engfuncs.pfnMessageBegin) return;
+    if (!pPlayer || pPlayer != FindActivePlayer() || m_msgScreenFade <= 0 || !g_engfuncs.pfnMessageBegin) return;
     g_engfuncs.pfnMessageBegin(MSG_ONE_UNRELIABLE, m_msgScreenFade, nullptr, pPlayer);
     g_engfuncs.pfnWriteShort(FixedUnsigned16(fadeTime, (float)(1 << 12)));
     g_engfuncs.pfnWriteShort(FixedUnsigned16(holdTime, (float)(1 << 12)));
@@ -1016,7 +1151,7 @@ void ChaosManager::SendScreenFade(edict_t *pPlayer, byte r, byte g, byte b, byte
 }
 
 void ChaosManager::SendDynamicLight(const Vec3 &pos, int radius10, byte r, byte g, byte b, int life10, int decay10) {
-    if (!g_engfuncs.pfnMessageBegin) return;
+    if (!FindActivePlayer() || !g_engfuncs.pfnMessageBegin) return;
     // Verified GoldSrc TE_DLIGHT format: coord*3 + radius + r + g + b + life + decay (no brightness byte!)
     g_engfuncs.pfnMessageBegin(MSG_BROADCAST, SVC_TEMPENTITY, nullptr, nullptr);
     g_engfuncs.pfnWriteByte(TE_DLIGHT);
@@ -1033,7 +1168,7 @@ void ChaosManager::SendDynamicLight(const Vec3 &pos, int radius10, byte r, byte 
 }
 
 void ChaosManager::SendTeleportSplash(const Vec3 &pos) {
-    if (!g_engfuncs.pfnMessageBegin) return;
+    if (!FindActivePlayer() || !g_engfuncs.pfnMessageBegin) return;
     g_engfuncs.pfnMessageBegin(MSG_PVS, SVC_TEMPENTITY, pos, nullptr);
     g_engfuncs.pfnWriteByte(TE_TELEPORT);
     g_engfuncs.pfnWriteCoord(pos.x);
@@ -1043,7 +1178,7 @@ void ChaosManager::SendTeleportSplash(const Vec3 &pos) {
 }
 
 void ChaosManager::SendImplosion(const Vec3 &pos, int radius, int count, int life10) {
-    if (!g_engfuncs.pfnMessageBegin) return;
+    if (!FindActivePlayer() || !g_engfuncs.pfnMessageBegin) return;
     g_engfuncs.pfnMessageBegin(MSG_PVS, SVC_TEMPENTITY, pos, nullptr);
     g_engfuncs.pfnWriteByte(TE_IMPLOSION);
     g_engfuncs.pfnWriteCoord(pos.x);
@@ -1056,23 +1191,43 @@ void ChaosManager::SendImplosion(const Vec3 &pos, int radius, int count, int lif
 }
 
 void ChaosManager::SendSetFOV(edict_t *pPlayer, int fov) {
-    if (!pPlayer || m_msgSetFOV <= 0 || !g_engfuncs.pfnMessageBegin) return;
+    if (!pPlayer || pPlayer != FindActivePlayer() || m_msgSetFOV <= 0 || !g_engfuncs.pfnMessageBegin) return;
     pPlayer->v.fov = (float)fov;
     g_engfuncs.pfnMessageBegin(MSG_ONE, m_msgSetFOV, nullptr, pPlayer);
     g_engfuncs.pfnWriteByte(fov & 0xFF);
     g_engfuncs.pfnMessageEnd();
 }
 
+void ChaosManager::UpdateHevHudColor(edict_t *player) {
+    if (!gpGlobals || !player || player != FindActivePlayer() || m_msgHudColor <= 0 ||
+        !g_engfuncs.pfnCVarGetFloat || !g_engfuncs.pfnMessageBegin ||
+        !g_engfuncs.pfnWriteByte || !g_engfuncs.pfnMessageEnd) return;
+    float enabled = g_engfuncs.pfnCVarGetFloat("chaos_hev_hud");
+    bool orange = isfinite(enabled) && enabled > 0.0f;
+    if ((!orange && m_hudColorApplied != 1) ||
+        (orange && m_hudColorApplied == 1 && gpGlobals->time < m_nextHudColorTime)) return;
+    // The OF client implements the 3-byte HudColor message. This changes the
+    // color only; the Gearbox client and its weapon sprites remain in use.
+    g_engfuncs.pfnMessageBegin(MSG_ONE, m_msgHudColor, nullptr, player);
+    g_engfuncs.pfnWriteByte(orange ? 255 : 0);
+    g_engfuncs.pfnWriteByte(160);
+    g_engfuncs.pfnWriteByte(0);
+    g_engfuncs.pfnMessageEnd();
+    m_hudColorApplied = orange ? 1 : 0;
+    m_nextHudColorTime = gpGlobals->time + 5.0f;
+}
+
 void ChaosManager::SendChatAndConsole(edict_t *pPlayer, const char *msg) {
     if (!msg) return;
-    if (pPlayer && g_engfuncs.pfnClientPrintf) {
+    const bool ready = pPlayer && pPlayer == FindActivePlayer();
+    if (ready && g_engfuncs.pfnClientPrintf) {
         g_engfuncs.pfnClientPrintf(pPlayer, print_console, msg);
     } else if (g_engfuncs.pfnServerPrint) {
         g_engfuncs.pfnServerPrint(msg);
     }
 
     const bool ruChat = (!g_engfuncs.pfnCVarGetFloat || g_engfuncs.pfnCVarGetFloat("chaos_ru_chat") > 0.0f);
-    if (ruChat && pPlayer && m_msgSayText > 0 && g_engfuncs.pfnMessageBegin) {
+    if (ruChat && ready && m_msgSayText > 0 && g_engfuncs.pfnMessageBegin) {
         int entIdx = g_engfuncs.pfnIndexOfEdict ? g_engfuncs.pfnIndexOfEdict(pPlayer) : 1;
         // SayText is a variable-length user message with a 255-byte wire cap.
         // Stop at a UTF-8 boundary and leave ample room for the entity byte.
@@ -1165,11 +1320,11 @@ void ChaosManager::RefreshStatusHud(edict_t *pPlayer) {
     char hudBuf[384];
     if (enabled && !IsChaosSessionAvailable(pPlayer)) {
         snprintf(hudBuf, sizeof(hudBuf),
-                 "=== HL1 CHAOS v1.1 ===\nDEATHS: %d  (MAP: %d)\nWAITING FOR SINGLE PLAYER%s",
+                 "=== HL1 CHAOS v1.4.0 ===\nDEATHS: %d  (MAP: %d)\nWAITING FOR SINGLE PLAYER%s",
                  g_deathCounter.GetTotalDeaths(), g_deathCounter.GetMapDeaths(), runLine);
     } else if (enabled) {
         snprintf(hudBuf, sizeof(hudBuf),
-                 "=== HL1 CHAOS v1.1 ===\n"
+                 "=== HL1 CHAOS v1.4.0 ===\n"
                  "DEATHS: %d  (MAP: %d)\n"
                  "NEXT: %2ds [%s]\n"
                  "LAST: %s%s%s%s%s",
@@ -1184,7 +1339,7 @@ void ChaosManager::RefreshStatusHud(edict_t *pPlayer) {
                  runLine);
     } else {
         snprintf(hudBuf, sizeof(hudBuf),
-                 "=== HL1 CHAOS v1.1 [PAUSED] ===\n"
+                 "=== HL1 CHAOS v1.4.0 [PAUSED] ===\n"
                  "DEATHS: %d  (MAP: %d)\n"
                  "Type chaos_toggle to resume%s",
                  g_deathCounter.GetTotalDeaths(),
@@ -1292,81 +1447,86 @@ void ChaosManager::ExecuteEvent(edict_t *pPlayer, int eventId) {
              eventNum, ev.titleRu, ev.descRu, g_deathCounter.GetTotalDeaths());
     SendChatAndConsole(pPlayer, chatBuf);
 
-    if ((eventId >= CHAOS_RECIPE_START && eventId < CHAOS_RECIPE_END) || eventId >= CHAOS_EXTENSION_START) {
+    if (const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(eventId)) {
+        QueueItemToPlayer(pPlayer, gift->weapon);
+        if (gift->ammo) QueueItemToPlayer(pPlayer, gift->ammo);
+        if (gift->bonusAmmo) QueueItemToPlayer(pPlayer, gift->bonusAmmo);
+        PlayCueSound(pPlayer, "items/gunpickup2.wav", PITCH_NORM);
+        RefreshStatusHud(pPlayer);
+        return;
+    }
+    if ((eventId >= CHAOS_RECIPE_START && eventId < CHAOS_RECIPE_END) ||
+        (eventId >= CHAOS_EXTENSION_START && eventId < CHAOS_EXTENSION_END)) {
         RunTheme(pPlayer, ChaosRecipeTheme(eventId));
         RunVariant(pPlayer, ChaosRecipeVariant(eventId));
         RefreshStatusHud(pPlayer);
         return;
     }
+    int spawnedNpcs = -1;
     switch (eventId) {
         case 0: // HEADCRAB AMBUSH
-            SpawnMonstersAroundPlayer(pPlayer, "monster_headcrab", 3, head_hull, false);
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_headcrab", 3, head_hull, false);
             PlayCueSound(pPlayer, "debris/beamstart7.wav", PITCH_NORM);
             break;
 
         case 1: // BABY CRAB SWARM
-            SpawnMonstersAroundPlayer(pPlayer, "monster_babycrab", 5, head_hull, false);
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_babycrab", 5, head_hull, false);
             PlayCueSound(pPlayer, "debris/beamstart7.wav", PITCH_HIGH);
             break;
 
         case 2: // HOUNDEYE PACK
-            SpawnMonstersAroundPlayer(pPlayer, "monster_houndeye", 2, human_hull, false);
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_houndeye", 2, human_hull, false);
             PlayCueSound(pPlayer, "debris/beamstart7.wav", PITCH_NORM);
             break;
 
         case 3: // BULLSQUID SURPRISE
-            if (SpawnMonstersAroundPlayer(pPlayer, "monster_bullchicken", 1, human_hull, false) == 0) {
-                SpawnMonstersAroundPlayer(pPlayer, "monster_headcrab", 2, head_hull, false);
-            }
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_bullchicken", 1, large_hull, false);
+            if (!spawnedNpcs) spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_headcrab", 2, head_hull, false);
             PlayCueSound(pPlayer, "debris/beamstart7.wav", PITCH_LOW);
             break;
 
         case 4: // ZOMBIE OUTBREAK
-            if (SpawnMonstersAroundPlayer(pPlayer, "monster_zombie", 2, human_hull, false) == 0) {
-                SpawnMonstersAroundPlayer(pPlayer, "monster_headcrab", 3, head_hull, false);
-            }
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_zombie", 2, human_hull, false);
+            if (!spawnedNpcs) spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_headcrab", 3, head_hull, false);
             PlayCueSound(pPlayer, "debris/beamstart7.wav", PITCH_LOW);
             break;
 
         case 5: // VORTIGAUNT RAID
             SendScreenFade(pPlayer, 40, 255, 60, 75, 0.35f, 0.1f, FFADE_IN);
-            if (SpawnMonstersAroundPlayer(pPlayer, "monster_alien_slave", 1, human_hull, false) == 0) {
-                SpawnMonstersAroundPlayer(pPlayer, "monster_houndeye", 1, human_hull, false);
-            }
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_alien_slave", 1, human_hull, false);
+            if (!spawnedNpcs) spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_houndeye", 1, human_hull, false);
             PlayCueSound(pPlayer, "debris/beamstart7.wav", PITCH_NORM);
             break;
 
         case 6: // HECU MARINE DROP
-            if (SpawnMonstersAroundPlayer(pPlayer, "monster_human_grunt", 1, human_hull, false) == 0) {
-                SpawnMonstersAroundPlayer(pPlayer, "monster_snark", 3, head_hull, false);
-            }
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_human_grunt", 1, human_hull, false);
+            if (!spawnedNpcs) spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_snark", 3, head_hull, false);
             PlayCueSound(pPlayer, "buttons/button10.wav", PITCH_NORM);
             break;
 
         case 7: // ALIEN GRUNT HORNETS
-            if (SpawnMonstersAroundPlayer(pPlayer, "monster_alien_grunt", 1, human_hull, false) == 0) {
-                SpawnMonstersAroundPlayer(pPlayer, "monster_alien_slave", 1, human_hull, false);
-            }
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_alien_grunt", 1, large_hull, false);
+            if (!spawnedNpcs) spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_alien_slave", 1, human_hull, false);
             PlayCueSound(pPlayer, "debris/beamstart7.wav", PITCH_LOW);
             break;
 
         case 8: // SNARK PARTY
-            SpawnMonstersAroundPlayer(pPlayer, "monster_snark", 4, head_hull, false);
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_snark", 4, head_hull, false);
             PlayCueSound(pPlayer, "debris/zap4.wav", PITCH_HIGH);
             break;
 
         case 9: // ROACH INFESTATION
-            SpawnMonstersAroundPlayer(pPlayer, "monster_cockroach", 10, head_hull, true);
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_cockroach", 10, head_hull, true);
             PlayCueSound(pPlayer, "buttons/button3.wav", PITCH_HIGH);
             break;
 
         case 10: // BARNEY BACKUP
-            SpawnMonstersAroundPlayer(pPlayer, "monster_barney", 1, human_hull, true);
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_barney", 1, human_hull, true);
             PlayCueSound(pPlayer, "items/suitchargeok1.wav", PITCH_NORM);
             break;
 
         case 11: // PANICKED SCIENTISTS
-            SpawnMonstersAroundPlayer(pPlayer, "monster_scientist", 3, human_hull, true);
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_scientist", 3, human_hull, true);
             PlayCueSound(pPlayer, "buttons/button3.wav", PITCH_NORM);
             break;
 
@@ -1478,22 +1638,26 @@ void ChaosManager::ExecuteEvent(edict_t *pPlayer, int eventId) {
 
         case 22: // RANDOM WEAPON GIFT
         {
-            struct WeaponBundle { const char *wpn; const char *ammo1; const char *ammo2; };
-            static const WeaponBundle kBundles[] = {
-                { "weapon_357",       "ammo_357",       "ammo_357" },
-                { "weapon_shotgun",   "ammo_buckshot",  "ammo_buckshot" },
-                { "weapon_9mmAR",     "ammo_9mmAR",     "ammo_ARgrenades" },
-                { "weapon_crossbow",  "ammo_crossbow",  "ammo_crossbow" },
-                { "weapon_rpg",       "ammo_rpgclip",   "ammo_rpgclip" },
-                { "weapon_gauss",     "ammo_gaussclip", "ammo_gaussclip" },
-                { "weapon_egon",      "ammo_gaussclip", "ammo_gaussclip" },
-                { "weapon_hornetgun", nullptr,          nullptr }
-            };
-            const WeaponBundle &b = kBundles[NextXorShift(m_rngState) % (sizeof(kBundles) / sizeof(kBundles[0]))];
-            QueueItemToPlayer(pPlayer, b.wpn);
-            if (b.ammo1) QueueItemToPlayer(pPlayer, b.ammo1);
-            if (b.ammo2) QueueItemToPlayer(pPlayer, b.ammo2);
-            PlayCueSound(pPlayer, "items/gunpickup2.wav", PITCH_NORM);
+            const ChaosWeaponGiftDef *ready[CHAOS_WEAPON_GIFT_COUNT];
+            int count = 0;
+            // Prefer ordinary HL1 weapons. If the map prepared none of the
+            // common classes, fall back to any ready weapon instead of stalling.
+            for (int i = 0; i < CHAOS_HL_WEAPON_GIFT_COUNT; ++i) {
+                const int id = CHAOS_WEAPON_GIFT_START + i;
+                const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(id);
+                if (gift && !IsRareWeaponGift(id) && IsClassReady(gift->weapon)) ready[count++] = gift;
+            }
+            if (!count) for (int i = 0; i < CHAOS_WEAPON_GIFT_COUNT; ++i) {
+                const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(CHAOS_WEAPON_GIFT_START + i);
+                if (gift && IsClassReady(gift->weapon)) ready[count++] = gift;
+            }
+            if (count > 0) {
+                const ChaosWeaponGiftDef &gift = *ready[PickRandomIndex(count)];
+                QueueItemToPlayer(pPlayer, gift.weapon);
+                if (gift.ammo) QueueItemToPlayer(pPlayer, gift.ammo);
+                if (gift.bonusAmmo) QueueItemToPlayer(pPlayer, gift.bonusAmmo);
+                PlayCueSound(pPlayer, "items/gunpickup2.wav", PITCH_NORM);
+            }
             break;
         }
 
@@ -1634,7 +1798,7 @@ void ChaosManager::ExecuteEvent(edict_t *pPlayer, int eventId) {
             m_flDiscoEnd = now + ev.durationSec;
             m_flNextDiscoTick = now + 0.05f;
             m_discoPhase = 0;
-            LaunchNearbyEnemies(pPlayer, 900.0f, 460.0f);
+            LaunchNearbyEnemies(pPlayer, pPlayer->v.origin, 900.0f, 460.0f);
             PlayCueSound(pPlayer, "debris/zap4.wav", PITCH_HIGH);
             break;
 
@@ -1651,6 +1815,9 @@ void ChaosManager::ExecuteEvent(edict_t *pPlayer, int eventId) {
         default: break;
     }
 
+    if (spawnedNpcs == 0) {
+        SendChatAndConsole(pPlayer, "[ХАОС] НПС не создан: нет безопасного места, слота или необходимых ресурсов.\n");
+    }
     RefreshStatusHud(pPlayer);
 }
 
@@ -1806,8 +1973,8 @@ void ChaosManager::UpdateTimedModifiers(edict_t *pPlayer) {
             SendScreenShake(pPlayer, 14.0f, 80.0f, 1.4f);
             PlayCueSound(pPlayer, "debris/beamstart7.wav", PITCH_LOW);
 
-            // Launch nearby enemies
-            LaunchNearbyEnemies(pPlayer, 450.0f, 480.0f);
+            // The blast stays at the armed position even if the player moved.
+            LaunchNearbyEnemies(pPlayer, m_vecAnomalyOrigin, 450.0f, 480.0f);
 
             // Push player away if still standing close (never lethal!)
             Vec3 delta = pPlayer->v.origin - m_vecAnomalyOrigin;
@@ -1834,6 +2001,9 @@ void ChaosManager::UpdateTimedModifiers(edict_t *pPlayer) {
 
 void ChaosManager::OnStartFrame() {
     if (!m_serverActive || !gpGlobals) return;
+    // On load, an FL_CLIENT edict can exist before its netchan does. GoldSrc
+    // may run StartFrame during server activation, before client signon.
+    if (!FindActivePlayer()) return;
 
     const float now = gpGlobals->time;
     float interval = ChaosInterval();
@@ -1846,6 +2016,7 @@ void ChaosManager::OnStartFrame() {
         m_nextManualEventTime = now;
         m_flNextChaosTime = now + interval;
         m_flNextHudRefresh = now + 0.1f;
+        m_nextHudColorTime = 0.0f;
         m_lastBeepSecond = -1;
     } else if ((m_flNextChaosTime - now) > interval + 1.5f) {
         m_flNextChaosTime = now + interval;
@@ -1884,6 +2055,7 @@ void ChaosManager::OnStartFrame() {
     UpdateCheckpoint(pPlayer);
     const bool sessionAvailable = SyncSafetyContext(pPlayer);
     if (sessionAvailable) {
+        UpdateHevHudColor(pPlayer);
         if (!m_restrictedContext) {
             UpdateItemQueue(pPlayer);
             ActivateTotemIfNeeded(pPlayer);
@@ -1982,8 +2154,70 @@ void ChaosManager::AfterPlayerSave(edict_t *player, const PlayerSaveSnapshot &sn
     if (snapshot.changed & SAVE_PUNCH) player->v.punchangle = snapshot.punchangle;
 }
 
+void ChaosManager::BeforePlayerMove(playermove_s *move, qboolean server, MovementOverride &state) {
+    state = {false, false, 0.0f, 0.0f};
+    if (!move || !server || !g_engfuncs.pfnCVarGetFloat || !g_engfuncs.pfnPEntityOfEntIndex ||
+        move->player_index < 0 || move->player_index >= 64) return;
+    edict_t *player = g_engfuncs.pfnPEntityOfEntIndex(move->player_index + 1);
+    // Do not touch spectators, other players, scripted movement, water or
+    // ladders. The engine owns the original jump/collision/fall-damage code.
+    if (!player || !IsChaosSessionAvailable(player) || !IsMovementSafe(player) ||
+        move->dead || move->spectator || move->movetype != MOVETYPE_WALK ||
+        (move->flags & (FL_ONTRAIN | FL_FROZEN)) || !(player->v.flags & FL_ONGROUND) ||
+        player->v.waterlevel >= 2 || !(player->v.button & IN_JUMP)) return;
+
+    float autoJump = g_engfuncs.pfnCVarGetFloat("chaos_autojump");
+    if (isfinite(autoJump) && autoJump > 0.0f) move->oldbuttons &= ~IN_JUMP;
+
+    // Classic PM_Jump crops momentum at 1.7 * maxspeed. Raise only the local
+    // movement values for this jump and restore them immediately afterwards;
+    // walking speed, scripts and sv_maxspeed are not permanently modified.
+    // The engine's separate sv_maxvelocity safety limit still applies.
+    float noCap = g_engfuncs.pfnCVarGetFloat("chaos_bhop_nocap");
+    if (!(move->oldbuttons & IN_JUMP) && isfinite(noCap) && noCap > 0.0f &&
+        isfinite(move->maxspeed) && move->maxspeed > 0.0f &&
+        isfinite(move->clientmaxspeed) && move->clientmaxspeed >= 0.0f) {
+        const bool changeClient = move->clientmaxspeed > 0.0f && move->clientmaxspeed < 8192.0f;
+        state = {true, changeClient, move->maxspeed, move->clientmaxspeed};
+        if (move->maxspeed < 8192.0f) move->maxspeed = 8192.0f;
+        if (changeClient) move->clientmaxspeed = 8192.0f;
+    }
+}
+
+void ChaosManager::AfterPlayerMove(playermove_s *move, const MovementOverride &state) {
+    if (!move || !state.speed) return;
+    move->maxspeed = state.maxspeed;
+    // Preserve a change made deliberately by the original movement routine.
+    if (state.clientModified && move->clientmaxspeed == 8192.0f) move->clientmaxspeed = state.clientmaxspeed;
+}
+
 void ChaosManager::OnPlayerPreThink(edict_t *pPlayer) {
-    if (!pPlayer || pPlayer->free || !m_serverActive || pPlayer != FindActivePlayer()) return;
+    if (!m_serverActive || !gpGlobals || !pPlayer || pPlayer->free ||
+        !(pPlayer->v.flags & FL_CLIENT) || (pPlayer->v.flags & FL_FAKECLIENT) ||
+        !g_engfuncs.pfnPEntityOfEntIndex) return;
+
+    if (!FindActivePlayer()) {
+        // GoldSrc calls PlayerPreThink while processing a spawned client's
+        // user command, after netchan setup. Unlike ClientPutInServer, it also
+        // occurs for a restored save (SV_WriteSpawn skips PutInServer there).
+        int slots = gpGlobals->maxClients > 0 ? gpGlobals->maxClients : m_clientMax;
+        if (slots < 1 || slots > 64 || (gpGlobals->maxEntities > 0 && slots >= gpGlobals->maxEntities)) return;
+        int index = 0;
+        for (int i = 1; i <= slots; ++i) {
+            if (g_engfuncs.pfnPEntityOfEntIndex(i) == pPlayer) { index = i; break; }
+        }
+        if (!index) return;
+        m_networkPlayer = pPlayer;
+        m_networkPlayerIndex = index;
+        m_networkPlayerSerial = pPlayer->serialnumber;
+        m_hudColorApplied = -1;
+        m_nextHudColorTime = 0.0f;
+        m_flLastFrameTime = gpGlobals->time;
+        m_flNextChaosTime = gpGlobals->time + ChaosInterval();
+        m_flNextHudRefresh = gpGlobals->time + 0.1f;
+        m_lastBeepSecond = -1;
+    }
+    if (pPlayer != FindActivePlayer()) return;
     if (g_deathCounter.CheckPlayerState(pPlayer)) {
         ClearAllModifiers(pPlayer, true);
         ResetTransientState();
@@ -2095,7 +2329,29 @@ void ChaosManager::CmdTriggerById(int eventId) {
         return;
     }
     if (!IsEventAllowed(pPlayer, eventId)) {
-        SendChatAndConsole(pPlayer, "[ХАОС] Это событие недоступно: транспорт, HEV или ресурсы. Другие события продолжаются.\n");
+        const ChaosEventDef *event = ChaosGetEventDef(eventId);
+        const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(eventId);
+        if (event && event->requiresSuit && !PlayerHasSuit(pPlayer)) {
+            SendChatAndConsole(pPlayer, "[ХАОС] Для этого события нужен полученный костюм HEV/PCV.\n");
+        } else if (event && event->skipOnTram && IsIntroTramMap()) {
+            SendChatAndConsole(pPlayer, "[ХАОС] Это событие недоступно на вступительной карте.\n");
+        } else if (event && event->skipOnTram && IsRestrictedState(pPlayer)) {
+            SendChatAndConsole(pPlayer, "[ХАОС] Выйдите из транспорта, лестницы или сценарного управления.\n");
+        } else if (gift && !IsClassReady(gift->weapon)) {
+            char message[200];
+            if (eventId >= CHAOS_OPFOR_WEAPON_GIFT_START)
+                snprintf(message, sizeof(message), "[ХАОС] Класс %s не подготовлен этой картой/игрой. Для оружия OF нужен профиль Opposing Force.\n", gift->weapon);
+            else
+                snprintf(message, sizeof(message), "[ХАОС] Класс %s не подготовлен этой картой/игрой.\n", gift->weapon);
+            SendChatAndConsole(pPlayer, message);
+        } else if ((eventId == 22 || eventId == 23 || eventId == 42) && !HasReadyWeaponForEvent(eventId)) {
+            SendChatAndConsole(pPlayer, "[ХАОС] Нет подготовленного оружия для этого события.\n");
+        } else if ((gift || eventId == 22 || eventId == 23 || eventId == 42) &&
+                   gpGlobals && gpGlobals->maxEntities > 0 && g_engfuncs.pfnNumberOfEntities && !HasEntityHeadroom()) {
+            SendChatAndConsole(pPlayer, "[ХАОС] Недостаточно свободных игровых сущностей для выдачи оружия.\n");
+        } else {
+            SendChatAndConsole(pPlayer, "[ХАОС] Событие сейчас недоступно; другие события продолжаются.\n");
+        }
         return;
     }
     if (gpGlobals && gpGlobals->time < m_nextManualEventTime) return;
@@ -2159,7 +2415,8 @@ void ChaosManager::CmdRecover() {
 void ChaosManager::CmdPrintList(edict_t *pPlayer, int page) {
     if (!pPlayer) pPlayer = FindActivePlayer();
     auto printLine = [&](const char *line) {
-        if (pPlayer && g_engfuncs.pfnClientPrintf) g_engfuncs.pfnClientPrintf(pPlayer, print_console, line);
+        if (pPlayer && pPlayer == FindActivePlayer() && g_engfuncs.pfnClientPrintf)
+            g_engfuncs.pfnClientPrintf(pPlayer, print_console, line);
         else if (g_engfuncs.pfnServerPrint) g_engfuncs.pfnServerPrint(line);
     };
     const int perPage = 25;
@@ -2183,7 +2440,7 @@ void ChaosManager::CmdPrintStatus(edict_t *pPlayer) {
     if (!pPlayer) pPlayer = FindActivePlayer();
     char buf[256];
     snprintf(buf, sizeof(buf),
-             "[ХАОС v1.1] Смертей всего: %d | На этой карте: %d | Пережито событий: %d | До след. события: %.1f сек\n",
+             "[ХАОС v1.4.0] Смертей всего: %d | На этой карте: %d | Пережито событий: %d | До след. события: %.1f сек\n",
              g_deathCounter.GetTotalDeaths(),
              g_deathCounter.GetMapDeaths(),
              g_deathCounter.GetTotalEvents(),
