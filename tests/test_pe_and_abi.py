@@ -168,9 +168,47 @@ def verify_linux_elf(so_path: str) -> None:
     print(f"[OK] {so_path}: Valid 32-bit i386 ELF shared library ({len(data)} bytes)")
 
 
+def verify_hud_installers() -> None:
+    exe = ROOT / "hl_randomizer_opfor/install_hev_hud.exe"
+    data = exe.read_bytes()
+    assert data[:2] == b"MZ"
+    pe = struct.unpack_from("<I", data, 0x3c)[0]
+    sig, machine, count = struct.unpack_from("<IHH", data, pe)
+    assert sig == 0x4550 and machine == 0x14c
+    opt = pe + 24
+    assert struct.unpack_from("<H", data, opt)[0] == 0x10b
+    optsize = struct.unpack_from("<H", data, pe + 20)[0]
+    sec = opt + optsize
+    sections = [struct.unpack_from("<8sIIII", data, sec + 40 * i) for i in range(count)]
+
+    def offset(rva):
+        for _, size, va, rawsize, raw in sections:
+            if va <= rva < va + max(size, rawsize):
+                return raw + rva - va
+        raise AssertionError(f"Unmapped installer RVA {rva:x}")
+
+    imports = []
+    imp = struct.unpack_from("<I", data, opt + 104)[0]
+    assert imp
+    idx = offset(imp)
+    while True:
+        _, _, _, name_rva, iat = struct.unpack_from("<IIIII", data, idx)
+        if not name_rva and not iat:
+            break
+        pos = offset(name_rva)
+        name = data[pos:data.index(b"\x00", pos)].decode("ascii").lower()
+        assert not any(x in name for x in ("api-ms-win-crt-private", "libgcc", "libstdc++", "libwinpthread")), name
+        imports.append(name)
+        idx += 20
+    linux = (ROOT / "hl_randomizer_opfor/install_hev_hud_linux").read_bytes()
+    assert linux[:6] == b"\x7fELF\x02\x01" and struct.unpack_from("<H", linux, 18)[0] == 62
+    print(f"[OK] HEV HUD installers: Win32 PE with public runtime imports, Linux x86-64 ELF ({len(imports)} imports)")
+
+
 if __name__ == "__main__":
     verify_win32_pe("hl_randomizer/dlls/hl.dll")
     verify_linux_elf("hl_randomizer/dlls/hl.so")
+    verify_hud_installers()
     for name in ("hl.dll", "hl.so"):
         stock = ROOT / "hl_randomizer/dlls" / name
         opfor = ROOT / "hl_randomizer_opfor/dlls" / name

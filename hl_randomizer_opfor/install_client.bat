@@ -45,6 +45,11 @@ if errorlevel 1 (
 )
 echo Opposing Force client copied. Launch Half-Life with -game hl_randomizer_opfor.
 :success
+if exist "%MOD%install_hev_hud.exe" (
+  echo Preparing optional Half-Life health/armor sprites from local game files...
+  "%MOD%install_hev_hud.exe"
+  if errorlevel 1 echo HUD overlay was not installed; the Opposing Force client remains usable.
+)
 if not defined CHAOS_INSTALL_NO_PAUSE pause
 exit /b 0
 :fail

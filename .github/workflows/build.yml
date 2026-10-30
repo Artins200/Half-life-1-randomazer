@@ -73,6 +73,11 @@ jobs:
             Write-Output "::error title=Win32 tests failed::$details"
             exit $code
           }
+      - name: Test the checked-in HEV HUD installer
+        shell: pwsh
+        run: |
+          python tests/test_hev_hud_setup.py hl_randomizer_opfor/install_hev_hud.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test the checked-in Win32 DLL
         shell: pwsh
         run: |

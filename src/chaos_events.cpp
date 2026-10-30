@@ -1,4 +1,5 @@
 #include "chaos_events.h"
+#include "hlsdk_pmove.h"
 #include "death_counter.h"
 #include <stdio.h>
 #include <string.h>
@@ -124,6 +125,9 @@ ChaosManager::ChaosManager()
       m_msgScreenFade(0),
       m_msgSayText(0),
       m_msgTextMsg(0),
+      m_msgHudColor(0),
+      m_hudColorApplied(-1),
+      m_nextHudColorTime(0.0f),
       m_inWorldPrecache(false),
       m_pEdictList(nullptr),
       m_edictCount(0),
@@ -201,6 +205,9 @@ ChaosManager::ChaosManager()
     m_cvarMonsters = { "chaos_monsters", "1", FCVAR_SERVER | FCVAR_ARCHIVE, 1.0f, nullptr };
     m_cvarSpawnLimit = { "chaos_spawn_limit", "8", FCVAR_SERVER | FCVAR_ARCHIVE, 8.0f, nullptr };
     m_cvarIntroTroll = { "chaos_intro_troll", "1", FCVAR_SERVER | FCVAR_ARCHIVE, 1.0f, nullptr };
+    m_cvarAutoJump = { "chaos_autojump", "1", FCVAR_SERVER | FCVAR_ARCHIVE, 1.0f, nullptr };
+    m_cvarUncapBhop = { "chaos_bhop_nocap", "1", FCVAR_SERVER | FCVAR_ARCHIVE, 1.0f, nullptr };
+    m_cvarHevHud = { "chaos_hev_hud", "1", FCVAR_SERVER | FCVAR_ARCHIVE, 1.0f, nullptr };
     memset(m_classReady, 0, sizeof(m_classReady));
     memset(m_classStringIds, 0, sizeof(m_classStringIds));
     memset(m_soundReady, 0, sizeof(m_soundReady));
@@ -245,6 +252,9 @@ void ChaosManager::RegisterCvarsAndCommands() {
         g_engfuncs.pfnCVarRegister(&m_cvarMonsters);
         g_engfuncs.pfnCVarRegister(&m_cvarSpawnLimit);
         g_engfuncs.pfnCVarRegister(&m_cvarIntroTroll);
+        g_engfuncs.pfnCVarRegister(&m_cvarAutoJump);
+        g_engfuncs.pfnCVarRegister(&m_cvarUncapBhop);
+        g_engfuncs.pfnCVarRegister(&m_cvarHevHud);
     }
     if (g_engfuncs.pfnAddServerCommand) {
         g_engfuncs.pfnAddServerCommand((char *)"chaos_now", SrvCmd_ChaosNow);
@@ -271,13 +281,14 @@ void ChaosManager::RegisterCvarsAndCommands() {
     if (g_engfuncs.pfnServerCommand) g_engfuncs.pfnServerCommand((char *)"exec chaos.cfg\n");
 }
 
-void ChaosManager::OnRegUserMsg(const char *pszName, int iMsgId) {
+void ChaosManager::OnRegUserMsg(const char *pszName, int iMsgId, int size) {
     if (!pszName || iMsgId <= 0) return;
     if (strcmp(pszName, "SetFOV") == 0)          m_msgSetFOV = iMsgId;
     else if (strcmp(pszName, "ScreenShake") == 0) m_msgScreenShake = iMsgId;
     else if (strcmp(pszName, "ScreenFade") == 0)  m_msgScreenFade = iMsgId;
     else if (strcmp(pszName, "SayText") == 0)     m_msgSayText = iMsgId;
     else if (strcmp(pszName, "TextMsg") == 0)     m_msgTextMsg = iMsgId;
+    else if (strcmp(pszName, "HudColor") == 0)   m_msgHudColor = (size == 3) ? iMsgId : 0;
 }
 
 void ChaosManager::OnMapPrecacheReset() {
@@ -723,11 +734,24 @@ uint32_t static NextXorShift(uint32_t &state) {
     return x;
 }
 
-enum AutomaticEventPool { AUTO_NPC, AUTO_WEAPON, AUTO_OTHER, AUTO_RECIPE, AUTO_POOL_COUNT };
+int ChaosManager::PickRandomIndex(int count) {
+    if (count <= 0) return 0;
+    uint32_t r = NextXorShift(m_rngState);
+    if (g_engfuncs.pfnRandomLong) r ^= (uint32_t)g_engfuncs.pfnRandomLong(0, 100000);
+    return (int)(r % (uint32_t)count);
+}
+
+enum AutomaticEventPool { AUTO_NPC, AUTO_WEAPON_COMMON, AUTO_WEAPON_RARE, AUTO_OTHER, AUTO_RECIPE, AUTO_POOL_COUNT };
+
+static bool IsRareWeaponGift(int id) {
+    // HL1's explosive/alien weapons and every OF gift are deliberately rare.
+    return ChaosGetWeaponGift(id) && id >= CHAOS_WEAPON_GIFT_START + 6;
+}
 
 static AutomaticEventPool AutomaticPoolFor(int id) {
     if (id >= 0 && id < 12) return AUTO_NPC;
-    if (id == 22 || id == 23 || id == 42 || ChaosGetWeaponGift(id)) return AUTO_WEAPON;
+    if (id == 23 || id == 42 || IsRareWeaponGift(id)) return AUTO_WEAPON_RARE;
+    if (id == 22 || ChaosGetWeaponGift(id)) return AUTO_WEAPON_COMMON;
     if ((id >= CHAOS_RECIPE_START && id < CHAOS_RECIPE_END) ||
         (id >= CHAOS_EXTENSION_START && id < CHAOS_EXTENSION_END)) return AUTO_RECIPE;
     return AUTO_OTHER;
@@ -742,12 +766,12 @@ int ChaosManager::PickNextEventId(const edict_t *pPlayer) {
     int freshCounts[AUTO_POOL_COUNT] = {};
     // Select a category first, then an ID. 432 recipes must not outweigh all
     // standalone NPCs simply because there are more combinations in the list.
-    const int weights[AUTO_POOL_COUNT] = {50, 35, 10, 5};
+    int weights[AUTO_POOL_COUNT] = {50, 31, 4, 10, 5};
     const bool restricted = IsRestrictedState(pPlayer);
     for (int i = 0; i < CHAOS_EVENT_COUNT; ++i) {
         if (!IsEventAllowedInSession(pPlayer, i)) continue;
         AutomaticEventPool pool = AutomaticPoolFor(i);
-        if (pool == AUTO_WEAPON && m_itemQueueCount > 0) continue;
+        if ((pool == AUTO_WEAPON_COMMON || pool == AUTO_WEAPON_RARE) && m_itemQueueCount > 0) continue;
         if (pool == AUTO_RECIPE) {
             // Intro/cutscenes get standalone visual events only. The two AWP
             // combinations that immediately overwrite their own FOV are
@@ -763,6 +787,9 @@ int ChaosManager::PickNextEventId(const edict_t *pPlayer) {
         if (!recent) ++freshCounts[pool];
     }
 
+    // If no rare class is prepared, retain the 35% overall weapon weight.
+    if (!counts[AUTO_WEAPON_RARE] && counts[AUTO_WEAPON_COMMON])
+        weights[AUTO_WEAPON_COMMON] += weights[AUTO_WEAPON_RARE];
     int totalWeight = 0;
     for (int p = 0; p < AUTO_POOL_COUNT; ++p) if (counts[p]) totalWeight += weights[p];
     if (!totalWeight) return -1;
@@ -1171,6 +1198,25 @@ void ChaosManager::SendSetFOV(edict_t *pPlayer, int fov) {
     g_engfuncs.pfnMessageEnd();
 }
 
+void ChaosManager::UpdateHevHudColor(edict_t *player) {
+    if (!gpGlobals || !player || player != FindActivePlayer() || m_msgHudColor <= 0 ||
+        !g_engfuncs.pfnCVarGetFloat || !g_engfuncs.pfnMessageBegin ||
+        !g_engfuncs.pfnWriteByte || !g_engfuncs.pfnMessageEnd) return;
+    float enabled = g_engfuncs.pfnCVarGetFloat("chaos_hev_hud");
+    bool orange = isfinite(enabled) && enabled > 0.0f;
+    if ((!orange && m_hudColorApplied != 1) ||
+        (orange && m_hudColorApplied == 1 && gpGlobals->time < m_nextHudColorTime)) return;
+    // The OF client implements the 3-byte HudColor message. This changes the
+    // color only; the Gearbox client and its weapon sprites remain in use.
+    g_engfuncs.pfnMessageBegin(MSG_ONE, m_msgHudColor, nullptr, player);
+    g_engfuncs.pfnWriteByte(orange ? 255 : 0);
+    g_engfuncs.pfnWriteByte(160);
+    g_engfuncs.pfnWriteByte(0);
+    g_engfuncs.pfnMessageEnd();
+    m_hudColorApplied = orange ? 1 : 0;
+    m_nextHudColorTime = gpGlobals->time + 5.0f;
+}
+
 void ChaosManager::SendChatAndConsole(edict_t *pPlayer, const char *msg) {
     if (!msg) return;
     const bool ready = pPlayer && pPlayer == FindActivePlayer();
@@ -1274,11 +1320,11 @@ void ChaosManager::RefreshStatusHud(edict_t *pPlayer) {
     char hudBuf[384];
     if (enabled && !IsChaosSessionAvailable(pPlayer)) {
         snprintf(hudBuf, sizeof(hudBuf),
-                 "=== HL1 CHAOS v1.3.1 ===\nDEATHS: %d  (MAP: %d)\nWAITING FOR SINGLE PLAYER%s",
+                 "=== HL1 CHAOS v1.4.0 ===\nDEATHS: %d  (MAP: %d)\nWAITING FOR SINGLE PLAYER%s",
                  g_deathCounter.GetTotalDeaths(), g_deathCounter.GetMapDeaths(), runLine);
     } else if (enabled) {
         snprintf(hudBuf, sizeof(hudBuf),
-                 "=== HL1 CHAOS v1.3.1 ===\n"
+                 "=== HL1 CHAOS v1.4.0 ===\n"
                  "DEATHS: %d  (MAP: %d)\n"
                  "NEXT: %2ds [%s]\n"
                  "LAST: %s%s%s%s%s",
@@ -1293,7 +1339,7 @@ void ChaosManager::RefreshStatusHud(edict_t *pPlayer) {
                  runLine);
     } else {
         snprintf(hudBuf, sizeof(hudBuf),
-                 "=== HL1 CHAOS v1.3.1 [PAUSED] ===\n"
+                 "=== HL1 CHAOS v1.4.0 [PAUSED] ===\n"
                  "DEATHS: %d  (MAP: %d)\n"
                  "Type chaos_toggle to resume%s",
                  g_deathCounter.GetTotalDeaths(),
@@ -1594,12 +1640,19 @@ void ChaosManager::ExecuteEvent(edict_t *pPlayer, int eventId) {
         {
             const ChaosWeaponGiftDef *ready[CHAOS_WEAPON_GIFT_COUNT];
             int count = 0;
-            for (int i = 0; i < CHAOS_WEAPON_GIFT_COUNT; ++i) {
+            // Prefer ordinary HL1 weapons. If the map prepared none of the
+            // common classes, fall back to any ready weapon instead of stalling.
+            for (int i = 0; i < CHAOS_HL_WEAPON_GIFT_COUNT; ++i) {
+                const int id = CHAOS_WEAPON_GIFT_START + i;
+                const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(id);
+                if (gift && !IsRareWeaponGift(id) && IsClassReady(gift->weapon)) ready[count++] = gift;
+            }
+            if (!count) for (int i = 0; i < CHAOS_WEAPON_GIFT_COUNT; ++i) {
                 const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(CHAOS_WEAPON_GIFT_START + i);
                 if (gift && IsClassReady(gift->weapon)) ready[count++] = gift;
             }
             if (count > 0) {
-                const ChaosWeaponGiftDef &gift = *ready[NextXorShift(m_rngState) % (uint32_t)count];
+                const ChaosWeaponGiftDef &gift = *ready[PickRandomIndex(count)];
                 QueueItemToPlayer(pPlayer, gift.weapon);
                 if (gift.ammo) QueueItemToPlayer(pPlayer, gift.ammo);
                 if (gift.bonusAmmo) QueueItemToPlayer(pPlayer, gift.bonusAmmo);
@@ -1963,6 +2016,7 @@ void ChaosManager::OnStartFrame() {
         m_nextManualEventTime = now;
         m_flNextChaosTime = now + interval;
         m_flNextHudRefresh = now + 0.1f;
+        m_nextHudColorTime = 0.0f;
         m_lastBeepSecond = -1;
     } else if ((m_flNextChaosTime - now) > interval + 1.5f) {
         m_flNextChaosTime = now + interval;
@@ -2001,6 +2055,7 @@ void ChaosManager::OnStartFrame() {
     UpdateCheckpoint(pPlayer);
     const bool sessionAvailable = SyncSafetyContext(pPlayer);
     if (sessionAvailable) {
+        UpdateHevHudColor(pPlayer);
         if (!m_restrictedContext) {
             UpdateItemQueue(pPlayer);
             ActivateTotemIfNeeded(pPlayer);
@@ -2099,6 +2154,43 @@ void ChaosManager::AfterPlayerSave(edict_t *player, const PlayerSaveSnapshot &sn
     if (snapshot.changed & SAVE_PUNCH) player->v.punchangle = snapshot.punchangle;
 }
 
+void ChaosManager::BeforePlayerMove(playermove_s *move, qboolean server, MovementOverride &state) {
+    state = {false, false, 0.0f, 0.0f};
+    if (!move || !server || !g_engfuncs.pfnCVarGetFloat || !g_engfuncs.pfnPEntityOfEntIndex ||
+        move->player_index < 0 || move->player_index >= 64) return;
+    edict_t *player = g_engfuncs.pfnPEntityOfEntIndex(move->player_index + 1);
+    // Do not touch spectators, other players, scripted movement, water or
+    // ladders. The engine owns the original jump/collision/fall-damage code.
+    if (!player || !IsChaosSessionAvailable(player) || !IsMovementSafe(player) ||
+        move->dead || move->spectator || move->movetype != MOVETYPE_WALK ||
+        (move->flags & (FL_ONTRAIN | FL_FROZEN)) || !(player->v.flags & FL_ONGROUND) ||
+        player->v.waterlevel >= 2 || !(player->v.button & IN_JUMP)) return;
+
+    float autoJump = g_engfuncs.pfnCVarGetFloat("chaos_autojump");
+    if (isfinite(autoJump) && autoJump > 0.0f) move->oldbuttons &= ~IN_JUMP;
+
+    // Classic PM_Jump crops momentum at 1.7 * maxspeed. Raise only the local
+    // movement values for this jump and restore them immediately afterwards;
+    // walking speed, scripts and sv_maxspeed are not permanently modified.
+    // The engine's separate sv_maxvelocity safety limit still applies.
+    float noCap = g_engfuncs.pfnCVarGetFloat("chaos_bhop_nocap");
+    if (!(move->oldbuttons & IN_JUMP) && isfinite(noCap) && noCap > 0.0f &&
+        isfinite(move->maxspeed) && move->maxspeed > 0.0f &&
+        isfinite(move->clientmaxspeed) && move->clientmaxspeed >= 0.0f) {
+        const bool changeClient = move->clientmaxspeed > 0.0f && move->clientmaxspeed < 8192.0f;
+        state = {true, changeClient, move->maxspeed, move->clientmaxspeed};
+        if (move->maxspeed < 8192.0f) move->maxspeed = 8192.0f;
+        if (changeClient) move->clientmaxspeed = 8192.0f;
+    }
+}
+
+void ChaosManager::AfterPlayerMove(playermove_s *move, const MovementOverride &state) {
+    if (!move || !state.speed) return;
+    move->maxspeed = state.maxspeed;
+    // Preserve a change made deliberately by the original movement routine.
+    if (state.clientModified && move->clientmaxspeed == 8192.0f) move->clientmaxspeed = state.clientmaxspeed;
+}
+
 void ChaosManager::OnPlayerPreThink(edict_t *pPlayer) {
     if (!m_serverActive || !gpGlobals || !pPlayer || pPlayer->free ||
         !(pPlayer->v.flags & FL_CLIENT) || (pPlayer->v.flags & FL_FAKECLIENT) ||
@@ -2118,6 +2210,8 @@ void ChaosManager::OnPlayerPreThink(edict_t *pPlayer) {
         m_networkPlayer = pPlayer;
         m_networkPlayerIndex = index;
         m_networkPlayerSerial = pPlayer->serialnumber;
+        m_hudColorApplied = -1;
+        m_nextHudColorTime = 0.0f;
         m_flLastFrameTime = gpGlobals->time;
         m_flNextChaosTime = gpGlobals->time + ChaosInterval();
         m_flNextHudRefresh = gpGlobals->time + 0.1f;
@@ -2346,7 +2440,7 @@ void ChaosManager::CmdPrintStatus(edict_t *pPlayer) {
     if (!pPlayer) pPlayer = FindActivePlayer();
     char buf[256];
     snprintf(buf, sizeof(buf),
-             "[ХАОС v1.3.1] Смертей всего: %d | На этой карте: %d | Пережито событий: %d | До след. события: %.1f сек\n",
+             "[ХАОС v1.4.0] Смертей всего: %d | На этой карте: %d | Пережито событий: %d | До след. события: %.1f сек\n",
              g_deathCounter.GetTotalDeaths(),
              g_deathCounter.GetMapDeaths(),
              g_deathCounter.GetTotalEvents(),

@@ -84,7 +84,7 @@ static void WriteString(const char *s) {
     if (strstr(s, ">>> RANDOM EVENT #")) ++eventBanners;
     if (strstr(s, "NEXT:")) ++countdowns;
     if (strstr(s, "STORY / VEHICLE SAFE MODE")) ++oldSafeMode;
-    if (strstr(s, "HL1 CHAOS v1.3.1")) ++fixedVersionHud;
+    if (strstr(s, "HL1 CHAOS v1.4.0")) ++fixedVersionHud;
 }
 static int CmdArgc() { return 2; }
 static const char *CmdArgv(int n) { return n == 0 ? "chaos_trigger" : triggerId; }

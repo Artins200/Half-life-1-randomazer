@@ -45,7 +45,7 @@ static edict_t *Hook_CreateNamedEntity(int classname) {
 
 static int Hook_RegUserMsg(const char *pszName, int iSize) {
     int msgId = g_engfuncs.pfnRegUserMsg ? g_engfuncs.pfnRegUserMsg(pszName, iSize) : 0;
-    g_chaos.OnRegUserMsg(pszName, msgId);
+    g_chaos.OnRegUserMsg(pszName, msgId, iSize);
     return msgId;
 }
 
@@ -162,6 +162,14 @@ static void Hook_StartFrame(void) {
     g_chaos.OnStartFrame();
 }
 
+static void Hook_PlayerMove(struct playermove_s *move, qboolean server) {
+    if (!g_origDllFuncs.pfnPM_Move) return;
+    ChaosManager::MovementOverride state;
+    g_chaos.BeforePlayerMove(move, server, state);
+    g_origDllFuncs.pfnPM_Move(move, server);
+    g_chaos.AfterPlayerMove(move, state);
+}
+
 static void Hook_PlayerPreThink(edict_t *pEntity) {
     g_chaos.OnPlayerPreThink(pEntity);
     if (g_origDllFuncs.pfnPlayerPreThink) {
@@ -196,6 +204,7 @@ static void InstallDllHooks(DLL_FUNCTIONS *pFunctionTable) {
     pFunctionTable->pfnStartFrame         = Hook_StartFrame;
     pFunctionTable->pfnPlayerPreThink     = Hook_PlayerPreThink;
     pFunctionTable->pfnPlayerPostThink    = Hook_PlayerPostThink;
+    if (g_origDllFuncs.pfnPM_Move) pFunctionTable->pfnPM_Move = Hook_PlayerMove;
     pFunctionTable->pfnGetGameDescription = Hook_GetGameDescription;
 }
 

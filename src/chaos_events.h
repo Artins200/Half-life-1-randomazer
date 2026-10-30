@@ -11,7 +11,7 @@ public:
     ChaosManager();
 
     void RegisterCvarsAndCommands();
-    void OnRegUserMsg(const char *pszName, int iMsgId);
+    void OnRegUserMsg(const char *pszName, int iMsgId, int size);
     void OnMapPrecacheReset();
     void OnWorldPrecacheBegin();
     void OnWorldPrecacheEnd();
@@ -27,6 +27,10 @@ public:
     void OnStartFrame();
     void OnPlayerPreThink(edict_t *pPlayer);
     void OnPlayerPostThink(edict_t *pPlayer);
+
+    struct MovementOverride { bool speed, clientModified; float maxspeed, clientmaxspeed; };
+    void BeforePlayerMove(struct playermove_s *move, qboolean server, MovementOverride &state);
+    void AfterPlayerMove(struct playermove_s *move, const MovementOverride &state);
 
     // Serialize the player's pre-effect values, while keeping the live effect
     // active after the engine finishes writing the save.
@@ -77,6 +81,7 @@ private:
     bool HasEntityHeadroom() const;
 
     int PickNextEventId(const edict_t *pPlayer);
+    int PickRandomIndex(int count);
     void ExecuteEvent(edict_t *pPlayer, int eventId);
     void ClearAllModifiers(edict_t *pPlayer, bool restoreEngineCvars);
     void SuspendUnsafeEffects(edict_t *pPlayer);
@@ -130,6 +135,7 @@ private:
     void SendTeleportSplash(const Vec3 &pos);
     void SendImplosion(const Vec3 &pos, int radius, int count, int life10);
     void SendSetFOV(edict_t *pPlayer, int fov);
+    void UpdateHevHudColor(edict_t *pPlayer);
     void SendChatAndConsole(edict_t *pPlayer, const char *msg);
 
     void RefreshStatusHud(edict_t *pPlayer);
@@ -146,6 +152,9 @@ private:
     cvar_t m_cvarMonsters;
     cvar_t m_cvarSpawnLimit;
     cvar_t m_cvarIntroTroll;
+    cvar_t m_cvarAutoJump;
+    cvar_t m_cvarUncapBhop;
+    cvar_t m_cvarHevHud;
     bool   m_cvarsRegistered;
 
     // Captured UserMsg IDs
@@ -154,6 +163,9 @@ private:
     int m_msgScreenFade;
     int m_msgSayText;
     int m_msgTextMsg;
+    int m_msgHudColor;
+    int m_hudColorApplied;
+    float m_nextHudColorTime;
 
     // Only use stock classes/sounds already precached by the original game/map.
     bool m_classReady[64];

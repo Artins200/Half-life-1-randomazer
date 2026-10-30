@@ -1,4 +1,5 @@
 #include "hlsdk_mini.h"
+#include "hlsdk_pmove.h"
 #include "chaos_events.h"
 #include "chaos_features.h"
 #include "death_counter.h"
@@ -92,6 +93,7 @@ struct RecordedNetMsg {
     int type;
     int byteCount;
     int firstByte;
+    std::vector<int> bytes;
     std::vector<std::string> strings;
 };
 
@@ -352,6 +354,7 @@ static void Mock_MessageEnd(void) {
 static void Mock_WriteByte(int iValue) {
     assert(g_inMessage);
     if (g_curMsg.byteCount == 0) g_curMsg.firstByte = (iValue & 0xFF);
+    g_curMsg.bytes.push_back(iValue & 0xFF);
     g_curMsg.byteCount += 1;
 }
 static void Mock_WriteChar(int iValue) { (void)iValue; assert(g_inMessage); g_curMsg.byteCount += 1; }
@@ -422,10 +425,9 @@ static void Mock_MakeVectors(const float *rgflVector) {
 }
 
 static int Mock_RegUserMsg(const char *pszName, int iSize) {
-    (void)iSize;
     static int nextId = 64;
     int id = ++nextId;
-    g_chaos.OnRegUserMsg(pszName, id);
+    g_chaos.OnRegUserMsg(pszName, id, iSize);
     return id;
 }
 
@@ -532,6 +534,35 @@ static void Orig_Save(edict_t *entity, SAVERESTOREDATA *) {
         if (g_mutateFlagsDuringSave) entity->v.flags |= FL_FROZEN;
     }
 }
+static int g_origClientCommandCalls = 0;
+static void Orig_ClientCommand(edict_t *player) {
+    ++g_origClientCommandCalls;
+    // Stand in for the original GameDLL's cheat command and suit pickup.
+    if (player && g_cmdArgs.size() == 2 && g_cmdArgs[0] == "give" && g_cmdArgs[1] == "item_suit")
+        player->v.weapons |= (int)(1u << WEAPON_SUIT);
+}
+
+static int g_mockMoveCalls = 0;
+static float g_origMoveNewClientMax = -1;
+static void Orig_PlayerMove(playermove_s *move, qboolean) {
+    ++g_mockMoveCalls;
+    if (!move || !(g_edicts[1].v.button & IN_JUMP) || (move->oldbuttons & IN_JUMP) ||
+        !(move->flags & FL_ONGROUND) || move->movetype != MOVETYPE_WALK || move->dead) return;
+    // Emulate the classic PM_Jump momentum crop and held-button guard.
+    float speed = move->velocity.Length();
+    float maximum = move->maxspeed;
+    if (move->clientmaxspeed > 0 && move->clientmaxspeed < maximum) maximum = move->clientmaxspeed;
+    if (maximum > 0 && speed > 1.7f * maximum) {
+        float scale = 1.7f * maximum / speed * 0.65f;
+        move->velocity.x *= scale;
+        move->velocity.y *= scale;
+    }
+    move->velocity.z = 268.0f;
+    move->oldbuttons |= IN_JUMP;
+    move->flags &= ~FL_ONGROUND;
+    if (g_origMoveNewClientMax >= 0) move->clientmaxspeed = g_origMoveNewClientMax;
+}
+
 static void Orig_PlayerPreThink(edict_t *player) {
     if (player && !(player->v.flags & FL_ONGROUND)) g_origFallVelocity = -player->v.velocity.z;
 }
@@ -729,6 +760,23 @@ static void TestOpforWeaponDelivery(DLL_FUNCTIONS &dll) {
     g_chaos.CmdTriggerById(494);
     assert(Contains(g_consoleOutput, "костюм HEV"));
 
+    // The proxy forwards the stock cheat command and uses only the HEV bit;
+    // it does not require a separate vest or invent Gearbox private fields.
+    g_precacheOpforWeapons = true;
+    StartWorld(dll, "c1a2", 1, false);
+    g_cmdArgs = {"give", "item_suit"};
+    int forwarded = g_origClientCommandCalls;
+    dll.pfnClientCommand(&g_edicts[1]);
+    assert(g_origClientCommandCalls == forwarded + 1);
+    assert(g_edicts[1].v.weapons == (int)(1u << WEAPON_SUIT));
+    g_receivedItems.clear();
+    g_chaos.CmdTriggerById(480); Step(dll, 1.6f);
+    assert(std::find(g_receivedItems.begin(), g_receivedItems.end(), "weapon_shotgun") != g_receivedItems.end());
+    g_receivedItems.clear();
+    g_chaos.CmdTriggerById(494); Step(dll, 1.6f);
+    assert(std::find(g_receivedItems.begin(), g_receivedItems.end(), "weapon_eagle") != g_receivedItems.end());
+    g_precacheOpforWeapons = false;
+
     StartWorld(dll, "c0a0", 1, true);
     g_consoleOutput.clear();
     g_chaos.CmdTriggerById(494);
@@ -794,10 +842,12 @@ static void TestOpforWeaponDelivery(DLL_FUNCTIONS &dll) {
     g_receivedItems.clear();
     g_chaos.CmdTriggerById(42);
     Step(dll, 5.0f);
+    int opforDelivered = 0;
     for (int id = CHAOS_OPFOR_WEAPON_GIFT_START; id < CHAOS_EVENT_COUNT; ++id) {
         const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(id);
-        assert(std::find(g_receivedItems.begin(), g_receivedItems.end(), gift->weapon) != g_receivedItems.end());
+        if (std::find(g_receivedItems.begin(), g_receivedItems.end(), gift->weapon) != g_receivedItems.end()) ++opforDelivered;
     }
+    assert(opforDelivered == 1 && "the OF kit should give one random weapon, not the entire arsenal");
     assert(std::find(g_receivedItems.begin(), g_receivedItems.end(), "weapon_9mmAR") == g_receivedItems.end());
     g_precacheOpforWeapons = false;
 }
@@ -932,6 +982,123 @@ static bool HasReceivedWeapon() {
     return false;
 }
 
+static void TestHeldJumpAndMomentum(DLL_FUNCTIONS &dll) {
+    printf("[movement] Held jump, momentum, opt-outs and single-player safety...\n");
+    Mock_CVarSetFloat("chaos_enabled", 0);
+    Mock_CVarSetFloat("chaos_autojump", 1);
+    Mock_CVarSetFloat("chaos_bhop_nocap", 1);
+    StartWorld(dll, "c1a2", 1, true);
+    g_edicts[1].v.button = IN_JUMP;
+    playermove_s move = {};
+    move.player_index = 0;
+    move.movetype = MOVETYPE_WALK;
+    move.flags = FL_CLIENT | FL_ONGROUND;
+    move.oldbuttons = IN_JUMP | IN_DUCK;
+    move.maxspeed = 320;
+    move.clientmaxspeed = 300;
+    move.velocity = Vec3(1000, 0, 0);
+    int calls = g_mockMoveCalls;
+    dll.pfnPM_Move(&move, TRUE);
+    assert(g_mockMoveCalls == calls + 1 && move.velocity.z == 268 && move.velocity.x == 1000);
+    assert(move.maxspeed == 320 && move.clientmaxspeed == 300);
+    assert((move.oldbuttons & (IN_JUMP | IN_DUCK)) == (IN_JUMP | IN_DUCK) && !(move.flags & FL_ONGROUND));
+    assert(g_edicts[1].v.maxspeed == 320 && Mock_CVarGetFloat("sv_maxspeed") == 320);
+    // Landing while still holding jump should trigger another jump.
+    move.flags |= FL_ONGROUND; move.velocity.z = 0;
+    dll.pfnPM_Move(&move, TRUE);
+    assert(move.velocity.z == 268 && move.velocity.x == 1000);
+
+    // Neither prediction calls nor unsafe movement are modified.
+    move.flags |= FL_ONGROUND; move.velocity.z = 0; move.oldbuttons = IN_JUMP;
+    dll.pfnPM_Move(&move, FALSE); assert(move.velocity.z == 0 && move.oldbuttons == IN_JUMP);
+    g_edicts[1].v.flags &= ~FL_ONGROUND;
+    move.flags &= ~FL_ONGROUND;
+    dll.pfnPM_Move(&move, TRUE); assert(move.velocity.z == 0 && move.oldbuttons == IN_JUMP);
+    move.flags |= FL_ONGROUND; g_edicts[1].v.flags |= FL_ONGROUND | FL_FROZEN;
+    dll.pfnPM_Move(&move, TRUE); assert(move.velocity.z == 0 && move.oldbuttons == IN_JUMP);
+    g_edicts[1].v.flags &= ~FL_FROZEN;
+    g_edicts[1].v.flags |= FL_ONTRAIN;
+    dll.pfnPM_Move(&move, TRUE); assert(move.velocity.z == 0 && move.oldbuttons == IN_JUMP);
+    g_edicts[1].v.flags &= ~FL_ONTRAIN;
+    move.dead = TRUE;
+    dll.pfnPM_Move(&move, TRUE); assert(move.velocity.z == 0 && move.oldbuttons == IN_JUMP);
+    move.dead = FALSE;
+    g_edicts[1].v.waterlevel = 2;
+    dll.pfnPM_Move(&move, TRUE); assert(move.velocity.z == 0 && move.oldbuttons == IN_JUMP);
+    g_edicts[1].v.waterlevel = 0;
+    move.movetype = MOVETYPE_FLY; g_edicts[1].v.movetype = MOVETYPE_FLY;
+    dll.pfnPM_Move(&move, TRUE); assert(move.velocity.z == 0 && move.oldbuttons == IN_JUMP);
+    move.movetype = MOVETYPE_WALK; g_edicts[1].v.movetype = MOVETYPE_WALK;
+    g_mockGlobals.deathmatch = 1;
+    dll.pfnPM_Move(&move, TRUE); assert(move.velocity.z == 0 && move.oldbuttons == IN_JUMP);
+    g_mockGlobals.deathmatch = 0;
+
+    // Each setting can be disabled independently, even while chaos is paused.
+    Mock_CVarSetFloat("chaos_autojump", 0);
+    dll.pfnPM_Move(&move, TRUE); assert(move.velocity.z == 0 && move.oldbuttons == IN_JUMP);
+    Mock_CVarSetFloat("chaos_autojump", 1);
+    Mock_CVarSetFloat("chaos_bhop_nocap", 0);
+    dll.pfnPM_Move(&move, TRUE);
+    assert(move.velocity.z == 268 && move.velocity.x < 400 && move.maxspeed == 320 && move.clientmaxspeed == 300);
+    Mock_CVarSetFloat("chaos_bhop_nocap", 1);
+    move.flags |= FL_ONGROUND; move.velocity = Vec3(1000, 0, 0); move.oldbuttons = 0;
+    move.clientmaxspeed = 0; // valid engine default must remain zero
+    dll.pfnPM_Move(&move, TRUE);
+    assert(move.velocity.x == 1000 && move.clientmaxspeed == 0 && move.maxspeed == 320);
+    move.flags |= FL_ONGROUND; move.velocity = Vec3(1000, 0, 0); move.oldbuttons = 0;
+    move.clientmaxspeed = 300; g_origMoveNewClientMax = 245;
+    dll.pfnPM_Move(&move, TRUE);
+    assert(move.clientmaxspeed == 245 && move.maxspeed == 320); // keep original's change
+    g_origMoveNewClientMax = -1;
+    g_edicts[1].v.button = 0;
+}
+
+static void TestHudColorLifecycle(DLL_FUNCTIONS &dll) {
+    printf("[hud] Registered 3-byte OF color, opt-out, timing and disconnect safety...\n");
+    Mock_CVarSetFloat("chaos_enabled", 0);
+    Mock_CVarSetFloat("chaos_hev_hud", 1);
+    const int badId = g_testHookedEngine->pfnRegUserMsg("HudColor", 2);
+    StartWorld(dll, "c1a2", 1, true);
+    g_allMessages.clear(); Step(dll, 0.2f);
+    for (const auto &m : g_allMessages) assert(m.type != badId);
+    const int id = g_testHookedEngine->pfnRegUserMsg("HudColor", 3);
+    g_allMessages.clear(); Step(dll, 0.2f);
+    int orange = 0;
+    for (const auto &m : g_allMessages) if (m.type == id) {
+        assert(m.dest == MSG_ONE && m.bytes == std::vector<int>({255, 160, 0}));
+        ++orange;
+    }
+    assert(orange == 1);
+    g_allMessages.clear(); Step(dll, 4.0f);
+    for (const auto &m : g_allMessages) assert(m.type != id);
+    g_allMessages.clear(); Step(dll, 1.2f);
+    for (const auto &m : g_allMessages) if (m.type == id) ++orange;
+    assert(orange == 2); // periodically recover from a client HUD reset
+    Mock_CVarSetFloat("chaos_hev_hud", 0);
+    g_allMessages.clear(); Step(dll, 0.2f);
+    int green = 0;
+    for (const auto &m : g_allMessages) if (m.type == id) {
+        assert(m.bytes == std::vector<int>({0, 160, 0}));
+        ++green;
+    }
+    assert(green == 1);
+    g_allMessages.clear(); Step(dll, 5.2f);
+    for (const auto &m : g_allMessages) assert(m.type != id);
+    Mock_CVarSetFloat("chaos_hev_hud", 1);
+    g_allMessages.clear(); Step(dll, 0.2f);
+    bool reenabled = false;
+    for (const auto &m : g_allMessages) if (m.type == id && m.bytes == std::vector<int>({255, 160, 0})) reenabled = true;
+    assert(reenabled);
+    // An inactive slot must not receive a reliable user message.
+    g_clientBufferInitialized = false;
+    dll.pfnClientDisconnect(&g_edicts[1]);
+    g_allMessages.clear(); dll.pfnStartFrame();
+    for (const auto &m : g_allMessages) assert(m.type != id);
+    g_clientBufferInitialized = true;
+    // Disable the mock message for unrelated lifecycle tests.
+    g_testHookedEngine->pfnRegUserMsg("HudColor", 2);
+}
+
 static void TestNpcWeaponPriority(DLL_FUNCTIONS &dll) {
     printf("[3b] NPC spawn safety, fourteen real weapon deliveries and weighted automatic events...\n");
     Mock_CVarSetFloat("chaos_enabled", 0);
@@ -1029,6 +1196,35 @@ static void TestNpcWeaponPriority(DLL_FUNCTIONS &dll) {
     assert(npc + weapons >= 450 && recipes <= 75);
     assert(other > 0 && recipes > 0); // themed combinations still occasionally occur
 
+    // With both games' resources ready, sample the actual delivered classes.
+    // Stop the timer while each queue drains so one event is counted once.
+    g_precacheOpforWeapons = true;
+    StartWorld(dll, "c1a2", 1, true);
+    int commonDrops = 0, ofDrops = 0;
+    for (int n = 0; n < 800; ++n) {
+        RemoveSpawned(); g_edicts[1].v.health = 100; g_receivedItems.clear();
+        int id = WaitForAutomaticEvent(dll);
+        Mock_CVarSetFloat("chaos_enabled", 0); Step(dll, 3.0f);
+        if (IsWeaponDropEvent(id)) {
+            bool sawCommon = false, sawOf = false;
+            for (const std::string &item : g_receivedItems) {
+                for (int i = CHAOS_WEAPON_GIFT_START; i < CHAOS_OPFOR_WEAPON_GIFT_START; ++i)
+                    if (item == ChaosGetWeaponGift(i)->weapon) sawCommon = true;
+                for (int i = CHAOS_OPFOR_WEAPON_GIFT_START; i < CHAOS_EVENT_COUNT; ++i)
+                    if (item == ChaosGetWeaponGift(i)->weapon) sawOf = true;
+            }
+            if (id == 22) assert(sawCommon && !sawOf);
+            if (id == 42 || id >= CHAOS_OPFOR_WEAPON_GIFT_START) assert(sawOf && !sawCommon);
+            if (sawCommon) ++commonDrops;
+            if (sawOf) ++ofDrops;
+        }
+        g_allMessages.clear(); g_consoleOutput.clear();
+        Mock_CVarSetFloat("chaos_enabled", 1);
+    }
+    printf("    800 automatic events with OF available: HL weapon events=%d, OF weapon events=%d\n", commonDrops, ofDrops);
+    assert(commonDrops >= 160 && ofDrops >= 5 && commonDrops > ofDrops * 4);
+    g_precacheOpforWeapons = false;
+
     // A map with only the world-precached snark must keep choosing it even
     // when that ID is in recent history; its category cannot starve.
     StartWorld(dll, "c1a2", 1, true, false);
@@ -1081,6 +1277,16 @@ static void TestNpcWeaponPriority(DLL_FUNCTIONS &dll) {
     for (const std::string &item : g_receivedItems)
         if (item.compare(0, 7, "weapon_") == 0) assert(item == "weapon_9mmhandgun");
     g_stockWeaponFilter = nullptr;
+    // If no common HL class was prepared, event 22 must not stall.
+    g_precacheStockWeapons = false; g_precacheOpforWeapons = true;
+    StartWorld(dll, "c1a2", 1, true, false);
+    g_receivedItems.clear();
+    g_chaos.CmdTriggerById(22); Step(dll, 1.6f);
+    bool ofFallback = false;
+    for (int id = CHAOS_OPFOR_WEAPON_GIFT_START; id < CHAOS_EVENT_COUNT; ++id)
+        if (std::find(g_receivedItems.begin(), g_receivedItems.end(), ChaosGetWeaponGift(id)->weapon) != g_receivedItems.end()) ofFallback = true;
+    assert(ofFallback);
+    g_precacheStockWeapons = true; g_precacheOpforWeapons = false;
     Mock_CVarSetFloat("chaos_enabled", 1);
 
     // Before HEV, NPC and inventory spawns wait; other timed events continue.
@@ -1177,8 +1383,10 @@ int main() {
     dllTable.pfnSave     = Orig_Save;
     dllTable.pfnTouch    = Orig_Touch;
     dllTable.pfnUse      = Orig_Use;
+    dllTable.pfnClientCommand = Orig_ClientCommand;
     dllTable.pfnPlayerPreThink = Orig_PlayerPreThink;
     dllTable.pfnPlayerPostThink = Orig_PlayerPostThink;
+    dllTable.pfnPM_Move = Orig_PlayerMove;
 
     int ifaceVer = INTERFACE_VERSION;
     int ok = GetEntityAPI2(&dllTable, &ifaceVer);
@@ -1374,6 +1582,8 @@ int main() {
     TestBombSearchAndBlast(dllTable);
     TestNpcWeaponPriority(dllTable);
     TestOpforWeaponDelivery(dllTable);
+    TestHeldJumpAndMomentum(dllTable);
+    TestHudColorLifecycle(dllTable);
 
     printf("[4] Exercise all 500 events and expire every modifier...\n");
     StartWorld(dllTable, "c1a2", 10, true);

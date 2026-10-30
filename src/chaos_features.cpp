@@ -387,24 +387,30 @@ void ChaosManager::BlinkForward(edict_t *player) {
 }
 
 void ChaosManager::GiveOpforInspiredLoadout(edict_t *player) {
-    // Prefer actual Gearbox classes only when the original DLL/map precached
-    // them. Valve mode has no such classes, so it keeps the stock fallback.
-    bool hasOpforWeapon = false;
+    // Give only one prepared OF weapon per event; don't flood the player with
+    // the entire arsenal. The ordinary profile retains a stock fallback.
+    const ChaosWeaponGiftDef *ready[CHAOS_OPFOR_WEAPON_GIFT_COUNT];
+    int count = 0;
     for (int i = 0; i < CHAOS_OPFOR_WEAPON_GIFT_COUNT; ++i) {
         const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(CHAOS_OPFOR_WEAPON_GIFT_START + i);
-        if (!gift || !IsClassReady(gift->weapon)) continue;
-        hasOpforWeapon = true;
+        if (gift && IsClassReady(gift->weapon)) ready[count++] = gift;
+    }
+    if (count) {
+        const ChaosWeaponGiftDef *gift = ready[PickRandomIndex(count)];
         QueueItemToPlayer(player, gift->weapon);
         if (gift->ammo) QueueItemToPlayer(player, gift->ammo);
         if (gift->bonusAmmo) QueueItemToPlayer(player, gift->bonusAmmo);
+        return;
     }
-    if (hasOpforWeapon) return;
-    QueueItemToPlayer(player, "weapon_9mmAR");
-    QueueItemToPlayer(player, "ammo_9mmAR");
-    QueueItemToPlayer(player, "weapon_shotgun");
-    QueueItemToPlayer(player, "ammo_buckshot");
-    QueueItemToPlayer(player, "weapon_gauss");
-    QueueItemToPlayer(player, "ammo_gaussclip");
+    if (IsClassReady("weapon_9mmAR") || IsClassReady("weapon_shotgun")) {
+        QueueItemToPlayer(player, "weapon_9mmAR");
+        QueueItemToPlayer(player, "ammo_9mmAR");
+        QueueItemToPlayer(player, "weapon_shotgun");
+        QueueItemToPlayer(player, "ammo_buckshot");
+    } else {
+        QueueItemToPlayer(player, "weapon_gauss");
+        QueueItemToPlayer(player, "ammo_gaussclip");
+    }
 }
 
 void ChaosManager::RunTheme(edict_t *player, int theme) {

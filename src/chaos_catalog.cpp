@@ -59,7 +59,7 @@ static const ChaosEventDef g_specialDefs[CHAOS_SPECIAL_EVENT_COUNT] = {
     {39, "APERTURE PORTAL DEVICE", "Портальное устройство", "Две точки и безопасный переход между ними на одной карте.", CHAOS_CAT_PHYSICS, CHAOS_TONE_GOOD, 0, false, true},
     {40, "SPEEDRUN STRAT", "Спидран-страта", "Короткое ускорение и прыжок — без изменения времени игры.", CHAOS_CAT_PHYSICS, CHAOS_TONE_GOOD, 8, false, true},
     {41, "NEW GAME? JUST KIDDING!", "Новая игра? Троллинг!", "Фальшивый экран перезапуска: настоящие сохранения не трогаем.", CHAOS_CAT_VISUAL, CHAOS_TONE_WEIRD, 0, false, false},
-    {42, "OPFOR / HL LOADOUT", "Набор Opposing Force / HL1", "Оружие OF, если подготовлено; иначе доступные аналоги HL1.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true},
+    {42, "OPFOR / HL LOADOUT", "Набор Opposing Force / HL1", "Одно случайное оружие OF, если подготовлено; иначе аналоги HL1.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true},
     {43, "CREEPER? AW MAN!", "Крипер? О нет!", "Трёхсекундная несмертельная аномальная волна.", CHAOS_CAT_VISUAL, CHAOS_TONE_DANGER, 3, false, true}
 };
 

@@ -6,6 +6,12 @@ MOD=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 SOURCE="$MOD/../gearbox/cl_dlls/client.so"
 TARGET_DIR="$MOD/cl_dlls"
 TARGET="$TARGET_DIR/client.so"
+install_hud() {
+    if [ -x "$MOD/install_hev_hud_linux" ]; then
+        echo 'Preparing optional Half-Life health/armor sprites from local game files...'
+        "$MOD/install_hev_hud_linux" || echo 'HUD overlay was not installed; the Opposing Force client remains usable.' >&2
+    fi
+}
 if [ ! -f "$MOD/../gearbox/dlls/opfor.so" ] && [ ! -f "$MOD/../gearbox/dlls/opfor_i386.so" ]; then
     echo 'ERROR: gearbox/dlls/opfor.so not found. Install Opposing Force in the same Half-Life folder.' >&2
     exit 1
@@ -25,6 +31,7 @@ fi
 if [ -e "$TARGET" ]; then
     if cmp -s "$SOURCE" "$TARGET"; then
         echo 'Opposing Force client is already installed and matches.'
+        install_hud
         exit 0
     fi
     echo 'ERROR: cl_dlls/client.so already exists and differs. Back it up and replace it manually if desired.' >&2
@@ -38,3 +45,4 @@ if ! cmp -s "$SOURCE" "$TARGET"; then
     exit 1
 fi
 echo 'Opposing Force client copied. Launch Half-Life with -game hl_randomizer_opfor.'
+install_hud
