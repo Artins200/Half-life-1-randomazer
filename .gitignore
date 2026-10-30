@@ -17,3 +17,9 @@ hl_randomizer/deaths.txt
 hl_randomizer/SAVE/
 hl_randomizer/config.cfg
 hl_randomizer/custom.hpk
+hl_randomizer/chaos_stats.cfg.tmp
+hl_randomizer/deaths.txt.tmp
+
+# Local release archive and Python bytecode
+/hl_randomizer_chaos_ready.zip
+__pycache__/

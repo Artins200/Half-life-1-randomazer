@@ -1,9 +1,8 @@
 #ifndef CHAOS_EVENTS_H
 #define CHAOS_EVENTS_H
 
-#include "chaos_types.h"
+#include "chaos_catalog.h"
 
-#define CHAOS_EVENT_COUNT 38
 #define CHAOS_HISTORY_SIZE 8
 #define CHAOS_BREADCRUMB_COUNT 8
 
@@ -14,9 +13,11 @@ public:
     void RegisterCvarsAndCommands();
     void OnRegUserMsg(const char *pszName, int iMsgId);
     void OnMapPrecacheReset();
-    void OnTrackPrecacheModel(const char *modelName);
+    void OnWorldPrecacheBegin();
+    void OnWorldPrecacheEnd();
+    void OnWorldEntityCreated(int classname, edict_t *entity);
+    void OnMapEntitySpawned(const char *classname, edict_t *entity, int result);
     void OnTrackPrecacheSound(const char *soundName);
-    void OnWorldSpawnPost();
     void OnServerActivate(edict_t *pEdictList, int edictCount, int clientMax);
     void OnServerDeactivate();
     void OnClientPutInServer(edict_t *pPlayer);
@@ -26,13 +27,31 @@ public:
     void OnPlayerPreThink(edict_t *pPlayer);
     void OnPlayerPostThink(edict_t *pPlayer);
 
+    // Serialize the player's pre-effect values, while keeping the live effect
+    // active after the engine finishes writing the save.
+    struct PlayerSaveSnapshot {
+        unsigned changed;
+        int flags, renderfx;
+        float maxspeed, fov, renderamt;
+        Vec3 rendercolor, punchangle;
+    };
+    bool BeforePlayerSave(edict_t *player, PlayerSaveSnapshot &snapshot) const;
+    void AfterPlayerSave(edict_t *player, const PlayerSaveSnapshot &snapshot) const;
+
     // Server console command entry points
     void CmdTriggerRandom();
     void CmdTriggerById(int eventId);
     void CmdResetDeaths();
     void CmdToggle();
-    void CmdPrintList(edict_t *pPlayer);
+    void CmdRecover();
+    void CmdPrintList(edict_t *pPlayer, int page = 1);
     void CmdPrintStatus(edict_t *pPlayer);
+    void CmdTotem();
+    void CmdPortalGun();
+    void CmdPortalPlace(int slot);
+    void CmdPortalEnter();
+    void CmdSpeedrun();
+    void CmdC1A1(bool confirm);
 
     int GetEventCount() const { return CHAOS_EVENT_COUNT; }
     const ChaosEventDef *GetEventDef(int id) const;
@@ -43,19 +62,60 @@ private:
     edict_t *FindActivePlayer() const;
     bool IsIntroTramMap() const;
     bool PlayerHasSuit(const edict_t *pPlayer) const;
-    bool CanPrecacheMore() const;
-    bool PrecacheMonsterViaMaker(const char *monsterClassname);
+    bool IsClassReady(const char *classname) const;
+    int ClassStringId(const char *classname);
+    bool IsCueReady(const char *soundName) const;
+    bool IsChaosSessionAvailable(const edict_t *player) const;
+    bool IsRestrictedState(const edict_t *player) const;
+    bool SyncSafetyContext(edict_t *player);
+    bool IsEventAllowed(const edict_t *player, int eventId) const;
+    bool IsEventAllowedInSession(const edict_t *player, int eventId) const;
+    bool IsMovementSafe(const edict_t *player) const;
+    int CountChaosEntities() const;
+    bool HasEntityHeadroom() const;
 
     int PickNextEventId(const edict_t *pPlayer);
     void ExecuteEvent(edict_t *pPlayer, int eventId);
     void ClearAllModifiers(edict_t *pPlayer, bool restoreEngineCvars);
+    void SuspendUnsafeEffects(edict_t *pPlayer);
     void UpdateTimedModifiers(edict_t *pPlayer);
     void RecordBreadcrumb(const edict_t *pPlayer);
+    void ResetTransientState();
+    void ActivateTotemIfNeeded(edict_t *player);
+    void ShowNewGameTroll(edict_t *player);
+    void StartCsAnimeMeme(edict_t *player);
+    void UpdateCsAnimeMeme(edict_t *player);
+    void UpdateCheckpoint(edict_t *player);
+    void PlacePortal(edict_t *player, int slot);
+    void EnterPortal(edict_t *player);
+    void UpdatePortalUse(edict_t *player);
+    void RunTheme(edict_t *player, int theme);
+    void RunVariant(edict_t *player, int variant);
+    void ArmBomb(edict_t *player);
+    void BlinkForward(edict_t *player);
+    void GiveOpforInspiredLoadout(edict_t *player);
+
+    struct CvarOverride { const char *name; float original; float applied; bool active; };
+    void BeginOverride(CvarOverride &overrideState, float value);
+    void EndOverride(CvarOverride &overrideState);
+    void BeginGravity(float value, float seconds, const char *label);
+    void ExtendFallProtection(float seconds);
+    void UpdateFallProtection(edict_t *player);
+    void BeginSpeed(edict_t *player, float value, float acceleration, float seconds, const char *label);
+    void BeginIce(float seconds);
+    void BeginFov(edict_t *player, int fov, float seconds, const char *label);
+    void BeginShield(edict_t *player, float seconds);
+    void EndSpeed(edict_t *player);
+    void EndFov(edict_t *player);
+    void EndShield(edict_t *player);
 
     // Spawning & entity helpers
     bool FindSafeSpawnSpot(const edict_t *pPlayer, int hullType, float minDist, float maxDist, Vec3 &outPos) const;
     int SpawnMonstersAroundPlayer(edict_t *pPlayer, const char *classname, int count, int hullType, bool friendly);
     void GiveItemToPlayer(edict_t *pPlayer, const char *itemClassname);
+    void QueueItemToPlayer(edict_t *pPlayer, const char *itemClassname);
+    void UpdateItemQueue(edict_t *pPlayer);
+    void ClearItemQueue();
     void StripPlayerWeapons(edict_t *pPlayer);
     int LaunchNearbyEnemies(edict_t *pPlayer, float radius, float upwardVel);
 
@@ -81,6 +141,9 @@ private:
     cvar_t m_cvarInterval;
     cvar_t m_cvarSound;
     cvar_t m_cvarRuChat;
+    cvar_t m_cvarMonsters;
+    cvar_t m_cvarSpawnLimit;
+    cvar_t m_cvarIntroTroll;
     bool   m_cvarsRegistered;
 
     // Captured UserMsg IDs
@@ -90,20 +153,23 @@ private:
     int m_msgSayText;
     int m_msgTextMsg;
 
-    // Precache tracking per map
-    int  m_precachedModelCount;
-    int  m_precachedSoundCount;
-    bool m_bMonstersPrecached;
+    // Only use stock classes/sounds already precached by the original game/map.
+    bool m_classReady[64];
+    int  m_classStringIds[64]; // one engine string allocation per class/map
+    bool m_soundReady[16];
+    bool m_inWorldPrecache;
 
     // Server / player runtime state
     edict_t *m_pEdictList;
     int      m_edictCount;
     int      m_clientMax;
     bool     m_serverActive;
+    bool     m_restrictedContext;
 
     float m_flLastFrameTime;
     float m_flNextChaosTime;
     float m_flNextHudRefresh;
+    float m_nextManualEventTime;
     int   m_lastBeepSecond;
 
     int   m_lastEventId;
@@ -116,6 +182,38 @@ private:
     PlayerBreadcrumb m_breadcrumbs[CHAOS_BREADCRUMB_COUNT];
     int   m_breadcrumbHead;
     float m_flNextBreadcrumbTime;
+
+    // Preserve settings supplied by the game/player when temporary effects end.
+    CvarOverride m_gravityOverride, m_speedOverride, m_accelOverride;
+    CvarOverride m_frictionOverride, m_airOverride;
+    float m_previousPlayerSpeed;
+    float m_previousFov;
+    bool m_previousGodmode;
+    int m_previousRenderFx;
+    float m_previousRenderAmt;
+    Vec3 m_previousRenderColor;
+    Vec3 m_previousPunchAngle;
+
+    bool m_totemArmed;
+    bool m_portalEnabled;
+    struct PortalAnchor { Vec3 origin; bool valid; } m_portals[2];
+    float m_nextPortalUse;
+    float m_nextPortalVisual;
+    bool m_portalUseHeld;
+    bool m_speedrunActive;
+    float m_speedrunStart;
+    bool m_introSeen;
+    bool m_introPending;
+    float m_introAt;
+    int m_csAnimeFrame; // -1 = no animation
+    float m_nextCsAnimeFrame;
+    char m_itemQueue[32][32];
+    int m_itemQueueHead;
+    int m_itemQueueCount;
+    float m_nextItemTick;
+    bool m_checkpointPending;
+    bool m_checkpointPrepared;
+    float m_checkpointAt;
 
     // Timed modifier end timestamps (0.0f = inactive)
     float m_flGravityEnd;

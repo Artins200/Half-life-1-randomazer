@@ -1,4 +1,4 @@
-name: Build HL1 Randomizer Chaos Mod
+name: Build and test HL1 Chaos
 
 on:
   push:
@@ -7,49 +7,110 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-windows-msvc:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure Win32 (MSVC)
-        run: cmake -B build-win32 -A Win32 -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build Win32 hl.dll & Simulation Test
-        run: cmake --build build-win32 --config Release
-
-      - name: Run GoldSrc Chaos Simulation Test
-        run: .\build-win32\Release\test_chaos_simulation.exe
-
-      - name: Package Ready-to-Play Mod Folder
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path package/hl_randomizer/dlls | Out-Null
-          Copy-Item hl_randomizer/liblist.gam package/hl_randomizer/
-          Copy-Item hl_randomizer/autoexec.cfg package/hl_randomizer/
-          Copy-Item hl_randomizer/chaos.cfg package/hl_randomizer/
-          Copy-Item hl_randomizer/commandmenu.txt package/hl_randomizer/
-          Copy-Item build-win32/Release/hl.dll package/hl_randomizer/dlls/hl.dll
-          Copy-Item hl_randomizer/dlls/hl.so package/hl_randomizer/dlls/hl.so
-          Compress-Archive -Path package/hl_randomizer -DestinationPath hl_randomizer_chaos_mod.zip -Force
-
-      - name: Upload Mod Zip Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: hl_randomizer_chaos_mod
-          path: hl_randomizer_chaos_mod.zip
-
-  test-linux:
+  test-and-build-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Configure & Build Simulation Test
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install pinned Zig compiler
+        run: |
+          npm install --prefix "$RUNNER_TEMP/zigtool" --no-save --ignore-scripts @ryoppippi/zig-linux-x64@0.13.0
+          echo "ZIG_CXX=$RUNNER_TEMP/zigtool/node_modules/@ryoppippi/zig-linux-x64/zig c++" >> "$GITHUB_ENV"
+      - name: Build real x86 Windows and Linux libraries
+        run: make -B all
+      - name: Install 32-bit Linux runtime for loader test
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y libc6:i386
+      - name: Test simulation, Linux bridge and both x86 binaries
+        run: |
+          make test
+          make test-x86
+          make test-x86-glibc
+          make test-loader-x86
+      - name: CMake Release tests (assertions stay enabled)
         run: |
           cmake -B build-linux -DCMAKE_BUILD_TYPE=Release
           cmake --build build-linux -j2
+          ctest --test-dir build-linux --output-on-failure
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-hl-so
+          path: hl_randomizer/dlls/hl.so
 
-      - name: Run Simulation & Binary ABI Verification
+  test-and-build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure Win32 (MSVC)
+        run: cmake -B build-win32 -A Win32 -DCMAKE_BUILD_TYPE=Release
+      - name: Build Win32 DLL
+        shell: pwsh
         run: |
-          ./build-linux/test_chaos_simulation
-          python3 tests/test_pe_and_abi.py
+          $ErrorActionPreference = 'Continue'
+          $output = @(& cmake --build build-win32 --config Release 2>&1)
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output "$_" }
+          if ($code -ne 0) {
+            $details = [string]::Join("`n", @($output | Select-Object -Last 30))
+            $details = $details.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Win32 build failed::$details"
+            exit $code
+          }
+      - name: Test Win32 DLL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $output = @(& ctest --test-dir build-win32 -C Release --output-on-failure 2>&1)
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output "$_" }
+          if ($code -ne 0) {
+            $details = [string]::Join("`n", @($output | Select-Object -Last 60))
+            $details = $details.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Win32 tests failed::$details"
+            exit $code
+          }
+      - name: Test the checked-in Win32 DLL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $output = @(& python tests/test_bridge_loader_win.py hl_randomizer/dlls/hl.dll build-win32/Release/hl_orig.dll build-win32/Release/test_win_loader.exe 2>&1)
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output "$_" }
+          if ($code -ne 0) {
+            $details = [string]::Join("`n", @($output | Select-Object -Last 60))
+            $details = $details.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Checked-in Win32 DLL failed::$details"
+            exit $code
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-hl-dll
+          path: build-win32/Release/hl.dll
+
+  build-package:
+    runs-on: windows-latest
+    needs: [test-and-build-linux, test-and-build-windows]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-hl-so
+          path: hl_randomizer/dlls
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-hl-dll
+          path: hl_randomizer/dlls
+      - name: Assemble and verify the actual packaged libraries
+        shell: pwsh
+        run: |
+          python tests/test_pe_and_abi.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Compress-Archive -Path hl_randomizer, README.md, LICENSE -DestinationPath hl_randomizer_chaos_mod.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hl_randomizer_chaos_mod
+          path: hl_randomizer_chaos_mod.zip

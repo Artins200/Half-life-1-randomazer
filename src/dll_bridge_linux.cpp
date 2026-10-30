@@ -21,6 +21,7 @@ typedef int  (*PFN_SERVER_GETBLENDING)(int, void **, void *, float *, float *);
 typedef void (*PFN_ENTITY_FN)(entvars_t *);
 
 static void *g_hGameSo = nullptr;
+static bool g_loadAttempted = false;
 
 static PFN_GIVEFNPTRSTODLL    g_pfnOrigGiveFnptrs = nullptr;
 static PFN_GETENTITYAPI       g_pfnOrigGetEntityAPI = nullptr;
@@ -36,9 +37,9 @@ static void StripComponent(char *path) {
 }
 
 bool Bridge_LoadOriginalGameDll() {
-    if (g_hGameSo != nullptr) {
-        return true;
-    }
+    if (g_hGameSo != nullptr) return true;
+    if (g_loadAttempted) return false;
+    g_loadAttempted = true;
 
     Dl_info selfInfo;
     memset(&selfInfo, 0, sizeof(selfInfo));
@@ -98,7 +99,13 @@ bool Bridge_LoadOriginalGameDll() {
     g_pfnOrigGetNewDLLFunctions = (PFN_GETNEWDLLFUNCTIONS)dlsym(g_hGameSo, "GetNewDLLFunctions");
     g_pfnOrigServerGetBlending  = (PFN_SERVER_GETBLENDING)dlsym(g_hGameSo, "Server_GetBlendingInterface");
 
-    return (g_pfnOrigGiveFnptrs != nullptr);
+    if (!g_pfnOrigGiveFnptrs || (!g_pfnOrigGetEntityAPI && !g_pfnOrigGetEntityAPI2)) {
+        fprintf(stderr, "[HL1 Chaos Mod] Original game library has incompatible exports.\n");
+        dlclose(g_hGameSo);
+        g_hGameSo = nullptr;
+        return false;
+    }
+    return true;
 }
 
 bool Bridge_IsLoaded() {
@@ -115,12 +122,19 @@ int Bridge_ForwardGetEntityAPI(DLL_FUNCTIONS *pFunctionTable, int interfaceVersi
     if (g_pfnOrigGetEntityAPI) {
         return g_pfnOrigGetEntityAPI(pFunctionTable, interfaceVersion);
     }
+    if (g_pfnOrigGetEntityAPI2) {
+        int version = interfaceVersion;
+        return g_pfnOrigGetEntityAPI2(pFunctionTable, &version);
+    }
     return FALSE;
 }
 
 int Bridge_ForwardGetEntityAPI2(DLL_FUNCTIONS *pFunctionTable, int *interfaceVersion) {
     if (g_pfnOrigGetEntityAPI2) {
         return g_pfnOrigGetEntityAPI2(pFunctionTable, interfaceVersion);
+    }
+    if (g_pfnOrigGetEntityAPI && interfaceVersion) {
+        return g_pfnOrigGetEntityAPI(pFunctionTable, *interfaceVersion);
     }
     return FALSE;
 }
@@ -151,10 +165,22 @@ const char *Bridge_ResolveNameForFunction(uint32_t functionAddr) {
     if (functionAddr == 0) {
         return nullptr;
     }
+    struct NameCacheEntry { uint32_t address; const char *name; };
+    static NameCacheEntry cache[256] = {};
+    NameCacheEntry &slot = cache[(functionAddr >> 4) % 256];
+    if (slot.address == functionAddr) return slot.name;
+    slot.address = functionAddr;
+    slot.name = nullptr;
     Dl_info info;
     memset(&info, 0, sizeof(info));
-    if (dladdr((void *)(uintptr_t)functionAddr, &info) && info.dli_sname) {
-        return info.dli_sname;
+    Dl_info original;
+    memset(&original, 0, sizeof(original));
+    void *address = (void *)(uintptr_t)functionAddr;
+    if (g_pfnOrigGiveFnptrs && dladdr((void *)g_pfnOrigGiveFnptrs, &original) &&
+        dladdr(address, &info) && info.dli_sname && info.dli_saddr == address &&
+        info.dli_fbase == original.dli_fbase) {
+        slot.name = info.dli_sname;
+        return slot.name;
     }
     return nullptr;
 }
