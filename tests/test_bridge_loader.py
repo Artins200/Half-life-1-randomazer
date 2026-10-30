@@ -52,6 +52,25 @@ def main():
         subprocess.run(loader + [str(mod / "hl.so"), "present"], cwd=root, check=True)
         subprocess.run(loader + [str(missing / "hl.so"), "missing"], cwd=root, check=True)
 
+        # An isolated profile must load the installed Gearbox DLL and forward
+        # OF weapons/projectiles, even with a conflicting local/Valve DLL.
+        of_root = root / "with_opfor"
+        of_mod = of_root / "hl_randomizer_opfor" / "dlls"
+        gearbox = of_root / "gearbox" / "dlls"
+        valve = of_root / "valve" / "dlls"
+        for folder in (of_mod, gearbox, valve):
+            folder.mkdir(parents=True)
+        shutil.copyfile(mod / "hl.so", of_mod / "hl.so")
+        shutil.copyfile(mod / "hl_orig.so", of_mod / "hl_orig.so")
+        shutil.copyfile(mod / "hl_orig.so", valve / "hl.so")
+        shutil.copyfile(mod / "hl_orig.so", gearbox / "opfor.so")
+        subprocess.run(loader + [str(of_mod / "hl.so"), "opfor"], cwd=root, check=True)
+        (gearbox / "opfor.so").unlink()
+        shutil.copyfile(mod / "hl_orig.so", gearbox / "opfor_i386.so")
+        subprocess.run(loader + [str(of_mod / "hl.so"), "opfor_i386"], cwd=root, check=True)
+        (gearbox / "opfor_i386.so").unlink()
+        subprocess.run(loader + [str(of_mod / "hl.so"), "opfor_missing"], cwd=root, check=True)
+
 
 if __name__ == "__main__":
     main()

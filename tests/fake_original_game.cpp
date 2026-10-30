@@ -14,6 +14,8 @@ static enginefuncs_t *engine = nullptr;
 static int initCalls = 0;
 static int spawnCalls = 0;
 static int saveCalls = 0;
+static int restoreCalls = 0;
+static entvars_t savedVars;
 static int namedThinkCalls = 0;
 
 FAKE_EXPORT void FAKE_GIVE_CALL GiveFnptrsToDll(enginefuncs_t *funcs, globalvars_t *) { engine = funcs; }
@@ -30,7 +32,16 @@ static int FakeSpawn(edict_t *) {
     if (engine && engine->pfnPrecacheSound) engine->pfnPrecacheSound((char *)"fvox/beep.wav");
     return 17;
 }
-static void FakeSave(edict_t *, SAVERESTOREDATA *) { ++saveCalls; }
+static void FakeSave(edict_t *entity, SAVERESTOREDATA *) {
+    ++saveCalls;
+    if (entity) savedVars = entity->v;
+}
+static int FakeRestore(edict_t *entity, SAVERESTOREDATA *, int) {
+    ++restoreCalls;
+    if (!entity) return 0;
+    entity->v = savedVars;
+    return 1;
+}
 static const char *FakeDescription() { return "original"; }
 // Intentionally export only GetEntityAPI; the proxy must adapt API2 requests.
 FAKE_EXPORT int GetEntityAPI(DLL_FUNCTIONS *table, int version) {
@@ -39,10 +50,15 @@ FAKE_EXPORT int GetEntityAPI(DLL_FUNCTIONS *table, int version) {
     table->pfnGameInit = FakeGameInit;
     table->pfnSpawn = FakeSpawn;
     table->pfnSave = FakeSave;
+    table->pfnRestore = FakeRestore;
     table->pfnGetGameDescription = FakeDescription;
     return TRUE;
 }
 FAKE_EXPORT void worldspawn(entvars_t *v) { if (v) v->health = 321.0f; }
+// Prove that OF-only weapon and projectile entity wrappers forward into the
+// selected original DLL, rather than merely existing in the export table.
+FAKE_EXPORT void weapon_eagle(entvars_t *v) { if (v) v->health = 444.0f; }
+FAKE_EXPORT void spore(entvars_t *v) { if (v) v->health = 555.0f; }
 FAKE_EXPORT int fake_init_calls() { return initCalls; }
 FAKE_EXPORT int fake_spawn_calls() { return spawnCalls; }
 FAKE_EXPORT int fake_has_legacy_fallback() {
@@ -62,3 +78,4 @@ FAKE_EXPORT int fake_function_roundtrip() {
     return name && cached && strcmp(name, "fake_named_think") == 0 && strcmp(cached, name) == 0;
 }
 FAKE_EXPORT int fake_save_calls() { return saveCalls; }
+FAKE_EXPORT int fake_restore_calls() { return restoreCalls; }

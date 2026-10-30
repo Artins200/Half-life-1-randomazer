@@ -1,0 +1,34 @@
+"1" "Random event now" "chaos_now"
+"2" "Pause / resume" "chaos_toggle"
+"3" "Interval"
+{
+    "1" "5 seconds" "chaos_interval 5"
+    "2" "10 seconds" "chaos_interval 10"
+    "3" "15 seconds" "chaos_interval 15"
+    "4" "30 seconds" "chaos_interval 30"
+}
+"4" "Abilities"
+{
+    "1" "Arm totem" "chaos_totem"
+    "2" "Enable portal device" "chaos_portal_gun"
+    "3" "Place blue point" "chaos_portal_blue"
+    "4" "Place orange point" "chaos_portal_orange"
+    "5" "Enter nearby portal" "chaos_portal_enter"
+    "6" "Start / stop speedrun" "chaos_speedrun"
+}
+"5" "Status" "chaos_status"
+"6" "c1a1: read save warning" "chaos_c1a1"
+"7" "Repair physics / camera" "chaos_recover"
+"8" "CS 1.6 anime meme" "chaos_trigger 428"
+"9" "Opposing Force weapons (after HEV)"
+{
+    "1" "Pipe wrench" "chaos_trigger 491"
+    "2" "Knife" "chaos_trigger 492"
+    "3" "Barnacle grapple" "chaos_trigger 493"
+    "4" "Desert Eagle" "chaos_trigger 494"
+    "5" "M249" "chaos_trigger 495"
+    "6" "Sniper rifle" "chaos_trigger 496"
+    "7" "Spore launcher" "chaos_trigger 497"
+    "8" "Shock rifle" "chaos_trigger 498"
+    "9" "Displacer" "chaos_trigger 499"
+}

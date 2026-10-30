@@ -589,6 +589,7 @@ typedef struct {
 #define FL_PARTIALGROUND    (1 << 10)
 #define FL_WATERJUMP        (1 << 11)
 #define FL_FROZEN           (1 << 12)
+#define FL_FAKECLIENT       (1 << 13)
 #define FL_DUCKING          (1 << 14)
 #define FL_BASEVELOCITY     (1 << 22)
 #define FL_ONTRAIN          (1 << 24)

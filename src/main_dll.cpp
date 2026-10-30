@@ -27,7 +27,7 @@ extern "C" const enginefuncs_t *ChaosTestHookedEngine() { return &g_hookedEngfun
 #endif
 
 // ============================================================================
-// Engine callback hooks passed to original valve/dlls/hl.dll
+// Engine callback hooks passed to the selected original Valve or Gearbox DLL
 // ============================================================================
 
 static int Hook_PrecacheSound(char *s) {
@@ -131,6 +131,14 @@ static void Hook_ClientPutInServer(edict_t *pEntity) {
     g_chaos.OnClientPutInServer(pEntity);
 }
 
+static void Hook_ClientDisconnect(edict_t *pEntity) {
+    // Stop our sends before the engine tears down this client's buffers.
+    g_chaos.OnClientDisconnect(pEntity);
+    if (g_origDllFuncs.pfnClientDisconnect) {
+        g_origDllFuncs.pfnClientDisconnect(pEntity);
+    }
+}
+
 static void Hook_ClientKill(edict_t *pEntity) {
     g_deathCounter.OnClientKill();
     if (g_origDllFuncs.pfnClientKill) {
@@ -182,6 +190,7 @@ static void InstallDllHooks(DLL_FUNCTIONS *pFunctionTable) {
     pFunctionTable->pfnServerActivate     = Hook_ServerActivate;
     pFunctionTable->pfnServerDeactivate   = Hook_ServerDeactivate;
     pFunctionTable->pfnClientPutInServer  = Hook_ClientPutInServer;
+    pFunctionTable->pfnClientDisconnect   = Hook_ClientDisconnect;
     pFunctionTable->pfnClientKill         = Hook_ClientKill;
     pFunctionTable->pfnClientCommand      = Hook_ClientCommand;
     pFunctionTable->pfnStartFrame         = Hook_StartFrame;

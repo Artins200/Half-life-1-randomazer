@@ -8,8 +8,8 @@
 #include <sys/stat.h>
 #include <errno.h>
 
-// All of these abilities use the original game DLL and stock effects. They do
-// not require any third-party models, sounds, maps, or engine modification.
+// Abilities use the active original game DLL and its already-prepared effects.
+// Optional Gearbox weapons require the user's installed Opposing Force files.
 static bool SafePlayerContents(const Vec3 &origin, int hull) {
     if (!g_engfuncs.pfnPointContents || g_engfuncs.pfnPointContents(origin) != CONTENTS_EMPTY) return false;
     // The hull centre can be above lava/slime/water while the player's feet
@@ -387,7 +387,18 @@ void ChaosManager::BlinkForward(edict_t *player) {
 }
 
 void ChaosManager::GiveOpforInspiredLoadout(edict_t *player) {
-    // Stock analogues, never try to instantiate nonexistent gearbox classes.
+    // Prefer actual Gearbox classes only when the original DLL/map precached
+    // them. Valve mode has no such classes, so it keeps the stock fallback.
+    bool hasOpforWeapon = false;
+    for (int i = 0; i < CHAOS_OPFOR_WEAPON_GIFT_COUNT; ++i) {
+        const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(CHAOS_OPFOR_WEAPON_GIFT_START + i);
+        if (!gift || !IsClassReady(gift->weapon)) continue;
+        hasOpforWeapon = true;
+        QueueItemToPlayer(player, gift->weapon);
+        if (gift->ammo) QueueItemToPlayer(player, gift->ammo);
+        if (gift->bonusAmmo) QueueItemToPlayer(player, gift->bonusAmmo);
+    }
+    if (hasOpforWeapon) return;
     QueueItemToPlayer(player, "weapon_9mmAR");
     QueueItemToPlayer(player, "ammo_9mmAR");
     QueueItemToPlayer(player, "weapon_shotgun");

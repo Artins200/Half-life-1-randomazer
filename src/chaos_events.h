@@ -21,6 +21,7 @@ public:
     void OnServerActivate(edict_t *pEdictList, int edictCount, int clientMax);
     void OnServerDeactivate();
     void OnClientPutInServer(edict_t *pPlayer);
+    void OnClientDisconnect(edict_t *pPlayer);
     bool OnClientCommand(edict_t *pPlayer);
 
     void OnStartFrame();
@@ -165,6 +166,11 @@ private:
     int      m_edictCount;
     int      m_clientMax;
     bool     m_serverActive;
+    // An FL_CLIENT edict alone is not evidence of an initialized netchan:
+    // save restoration creates it before the client has completed signon.
+    edict_t *m_networkPlayer;
+    int      m_networkPlayerIndex;
+    int      m_networkPlayerSerial;
     bool     m_restrictedContext;
 
     float m_flLastFrameTime;

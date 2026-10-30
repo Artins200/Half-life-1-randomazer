@@ -31,6 +31,7 @@ static edict_t *worldEdict = nullptr;
 static int sphereSearchCalls = 0;
 static const char *triggerId = "14";
 static int eventBanners = 0, countdowns = 0, oldSafeMode = 0, fixedVersionHud = 0;
+static bool clientBufferInitialized = true;
 static int PrecacheSound(char *) { ++soundCalls; return 1; }
 static edict_t *EntityOfIndex(int index) { return index == 1 ? activePlayer : nullptr; }
 static int IndexOfEdict(const edict_t *edict) { return edict == activePlayer ? 1 : 0; }
@@ -51,7 +52,10 @@ static float CVarGetFloat(const char *name) {
     if (!strcmp(name, "chaos_interval")) return 10;
     return 0;
 }
-static void MessageBegin(int, int, const float *, edict_t *) {}
+static void MessageBegin(int dest, int, const float *, edict_t *) {
+    if (dest == MSG_ONE || dest == MSG_ONE_UNRELIABLE)
+        assert(clientBufferInitialized && "SZ_GetSpace: uninitialized client sizebuf_t");
+}
 static void MessageEnd() {}
 static void WriteInt(int) {}
 static void WriteCoord(float) {}
@@ -60,14 +64,16 @@ static void WriteString(const char *s) {
     if (strstr(s, ">>> RANDOM EVENT #")) ++eventBanners;
     if (strstr(s, "NEXT:")) ++countdowns;
     if (strstr(s, "STORY / VEHICLE SAFE MODE")) ++oldSafeMode;
-    if (strstr(s, "HL1 CHAOS v1.2")) ++fixedVersionHud;
+    if (strstr(s, "HL1 CHAOS v1.3")) ++fixedVersionHud;
 }
 static int CmdArgc() { return 2; }
 static const char *CmdArgv(int n) { return n == 0 ? "chaos_trigger" : triggerId; }
 
 int main(int argc, char **argv) {
     assert(argc == 3);
-    bool expectOriginal = strcmp(argv[2], "present") == 0;
+    const bool opforI386 = strcmp(argv[2], "opfor_i386") == 0;
+    const bool opforProfile = strcmp(argv[2], "opfor") == 0 || strcmp(argv[2], "opfor_missing") == 0 || opforI386;
+    const bool expectOriginal = strcmp(argv[2], "present") == 0 || strcmp(argv[2], "opfor") == 0 || opforI386;
     void *proxy = OpenModule(argv[1]);
     if (!proxy) {
 #ifdef _WIN32
@@ -120,6 +126,13 @@ int main(int argc, char **argv) {
     assert(strcmp(dll.pfnGetGameDescription(), "HL1: Randomizer Chaos") == 0);
     worldspawn(&world.v);
     assert(world.v.health == 321.0f);
+    if (opforProfile) {
+        EntityFn eagle = (EntityFn)FindModuleSymbol(proxy, "weapon_eagle");
+        EntityFn spore = (EntityFn)FindModuleSymbol(proxy, "spore");
+        assert(eagle && spore);
+        eagle(&world.v); assert(world.v.health == 444.0f);
+        spore(&world.v); assert(world.v.health == 555.0f);
+    }
 
     // Drive the actual loaded proxy through the intro and c1a0 without HEV.
     // This catches a stale shipped binary that merely passes export checks.
@@ -170,6 +183,42 @@ int main(int argc, char **argv) {
     dll.pfnClientCommand(&player); // chaos_trigger 14: real speed effect before HEV
     assert(eventBanners == 2 && player.v.maxspeed == 720);
 
+    // Exercise the actual loaded binary with an uninitialized client buffer at
+    // deactivation and a restored FL_CLIENT edict before client signon.
+    globals.time += 0.4f;
+    triggerId = "33";
+    dll.pfnClientCommand(&player);
+    assert(player.v.fov == 130);
+    assert(dll.pfnRestore);
+    dll.pfnSave(&player, nullptr);
+    assert(player.v.fov == 130 && player.v.maxspeed == 720); // live effects restored after serialization
+    clientBufferInitialized = false;
+    dll.pfnServerDeactivate();
+    globals.time = 1;
+    // Restore through the original game DLL, just as the engine does. The
+    // saved player contains the values from before the temporary effects.
+    player.v.fov = 77;
+    player.v.maxspeed = 77;
+    assert(dll.pfnRestore(&player, nullptr, 0) == 1);
+    assert(player.v.fov == 0 && player.v.maxspeed == 320 && (player.v.flags & FL_CLIENT));
+    dll.pfnServerActivate(&world, 2, 1);
+    // Save loads skip ClientPutInServer; merely seeing FL_CLIENT isn't enough.
+    eventBanners = countdowns = 0;
+    for (int i = 0; i < 70; ++i) {
+        globals.time += 0.2f;
+        dll.pfnStartFrame();
+    }
+    assert(eventBanners == 0 && countdowns == 0);
+    clientBufferInitialized = true;
+    dll.pfnPlayerPreThink(&player);
+    for (int i = 0; i < 55; ++i) {
+        globals.time += 0.2f;
+        dll.pfnPlayerPreThink(&player);
+        dll.pfnStartFrame();
+        dll.pfnPlayerPostThink(&player);
+    }
+    assert(eventBanners == 1 && countdowns > 0);
+
     // Run the bomb in a fresh session of the actual loaded binary. The fake
     // engine returns worldspawn at end-of-search, exactly as GoldSrc does;
     // the old DLL would resume from it and trip the assertion in the mock.
@@ -180,6 +229,7 @@ int main(int argc, char **argv) {
     player.v.velocity = Vec3(0, 0, 0);
     dll.pfnServerActivate(&world, 2, 1);
     dll.pfnClientPutInServer(&player);
+    dll.pfnPlayerPreThink(&player); // first spawned-client user command
     triggerId = "27";
     eventBanners = sphereSearchCalls = 0;
     dll.pfnClientCommand(&player);
@@ -209,16 +259,40 @@ int main(int argc, char **argv) {
     const char *originalName = "hl_orig.so";
 #endif
     assert(slash);
-    snprintf(slash + 1, sizeof(originalPath) - (size_t)(slash + 1 - originalPath), "%s", originalName);
+    if (opforProfile) {
+        // .../<Half-Life>/hl_randomizer_opfor/dlls/hl.* -> gearbox/dlls/opfor.*
+        *slash = '\0';
+        char *second = strrchr(originalPath, '/');
+#ifdef _WIN32
+        backslash = strrchr(originalPath, '\\');
+        if (!second || (backslash && backslash > second)) second = backslash;
+#endif
+        assert(second); *second = '\0';
+        char *third = strrchr(originalPath, '/');
+#ifdef _WIN32
+        backslash = strrchr(originalPath, '\\');
+        if (!third || (backslash && backslash > third)) third = backslash;
+#endif
+        assert(third);
+#ifdef _WIN32
+        snprintf(third + 1, sizeof(originalPath) - (size_t)(third + 1 - originalPath), "gearbox\\dlls\\opfor.dll");
+#else
+        snprintf(third + 1, sizeof(originalPath) - (size_t)(third + 1 - originalPath), "%s",
+                 opforI386 ? "gearbox/dlls/opfor_i386.so" : "gearbox/dlls/opfor.so");
+#endif
+    } else {
+        snprintf(slash + 1, sizeof(originalPath) - (size_t)(slash + 1 - originalPath), "%s", originalName);
+    }
     void *original = OpenModule(originalPath);
     assert(original);
     ProbeFn init = (ProbeFn)FindModuleSymbol(original, "fake_init_calls");
     ProbeFn spawn = (ProbeFn)FindModuleSymbol(original, "fake_spawn_calls");
     ProbeFn fallback = (ProbeFn)FindModuleSymbol(original, "fake_has_legacy_fallback");
     ProbeFn save = (ProbeFn)FindModuleSymbol(original, "fake_save_calls");
+    ProbeFn restore = (ProbeFn)FindModuleSymbol(original, "fake_restore_calls");
     ProbeFn roundtrip = (ProbeFn)FindModuleSymbol(original, "fake_function_roundtrip");
-    assert(init && spawn && fallback && save && roundtrip);
-    assert(init() == 1 && spawn() == 1 && fallback() == 1 && save() == 1);
+    assert(init && spawn && fallback && save && restore && roundtrip);
+    assert(init() == 1 && spawn() == 1 && fallback() == 1 && save() == 2 && restore() == 1);
     if (sizeof(void *) == 4) assert(roundtrip() == 1);
     CloseModule(original);
     CloseModule(proxy);

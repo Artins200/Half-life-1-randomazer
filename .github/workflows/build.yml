@@ -107,9 +107,12 @@ jobs:
       - name: Assemble and verify the actual packaged libraries
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Path hl_randomizer_opfor/dlls -Force | Out-Null
+          Copy-Item hl_randomizer/dlls/hl.dll hl_randomizer_opfor/dlls/hl.dll -Force
+          Copy-Item hl_randomizer/dlls/hl.so hl_randomizer_opfor/dlls/hl.so -Force
           python tests/test_pe_and_abi.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Compress-Archive -Path hl_randomizer, README.md, LICENSE -DestinationPath hl_randomizer_chaos_mod.zip -Force
+          Compress-Archive -Path hl_randomizer, hl_randomizer_opfor, README.md, LICENSE -DestinationPath hl_randomizer_chaos_mod.zip -Force
       - uses: actions/upload-artifact@v4
         with:
           name: hl_randomizer_chaos_mod

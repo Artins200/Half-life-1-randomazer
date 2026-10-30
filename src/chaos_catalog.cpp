@@ -59,7 +59,7 @@ static const ChaosEventDef g_specialDefs[CHAOS_SPECIAL_EVENT_COUNT] = {
     {39, "APERTURE PORTAL DEVICE", "Портальное устройство", "Две точки и безопасный переход между ними на одной карте.", CHAOS_CAT_PHYSICS, CHAOS_TONE_GOOD, 0, false, true},
     {40, "SPEEDRUN STRAT", "Спидран-страта", "Короткое ускорение и прыжок — без изменения времени игры.", CHAOS_CAT_PHYSICS, CHAOS_TONE_GOOD, 8, false, true},
     {41, "NEW GAME? JUST KIDDING!", "Новая игра? Троллинг!", "Фальшивый экран перезапуска: настоящие сохранения не трогаем.", CHAOS_CAT_VISUAL, CHAOS_TONE_WEIRD, 0, false, false},
-    {42, "OPFOR INSPIRED LOADOUT", "Набор в духе Opposing Force", "Выдаёт доступное штатное оружие HL1, без файлов Gearbox.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true},
+    {42, "OPFOR / HL LOADOUT", "Набор Opposing Force / HL1", "Оружие OF, если подготовлено; иначе доступные аналоги HL1.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true},
     {43, "CREEPER? AW MAN!", "Крипер? О нет!", "Трёхсекундная несмертельная аномальная волна.", CHAOS_CAT_VISUAL, CHAOS_TONE_DANGER, 3, false, true}
 };
 
@@ -70,8 +70,8 @@ static const ChaosEventDef g_extraDefs[CHAOS_EXTRA_EVENT_COUNT] = {
      CHAOS_CAT_VISUAL, CHAOS_TONE_WEIRD, 3, false, false}
 };
 
-// Standalone pickups, not cosmetic effect combinations. Only stock HL1
-// classes which the original game/map already precached may be instantiated.
+// Standalone pickups, not cosmetic effect combinations. Only classes that
+// the active original game/map already precached may be instantiated.
 static const ChaosWeaponGiftDef g_weaponGifts[CHAOS_WEAPON_GIFT_COUNT] = {
     {{477, "CROWBAR DELIVERY", "Доставка монтировки", "Штатная монтировка HL1.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_crowbar", nullptr, nullptr},
     {{478, "GLOCK DELIVERY", "Доставка Glock", "Пистолет и патроны 9 мм.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_9mmhandgun", "ammo_9mmclip", "ammo_9mmclip"},
@@ -86,7 +86,18 @@ static const ChaosWeaponGiftDef g_weaponGifts[CHAOS_WEAPON_GIFT_COUNT] = {
     {{487, "GRENADES DELIVERY", "Доставка гранат", "Ручные гранаты HL1.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_handgrenade", nullptr, nullptr},
     {{488, "SATCHEL DELIVERY", "Доставка взрывпакета", "Ранцевый заряд HL1.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_satchel", nullptr, nullptr},
     {{489, "TRIPMINE DELIVERY", "Доставка растяжки", "Лазерная мина HL1.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_tripmine", nullptr, nullptr},
-    {{490, "SNARK WEAPON DELIVERY", "Доставка снарков", "Оружие со снарками HL1.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_snark", nullptr, nullptr}
+    {{490, "SNARK WEAPON DELIVERY", "Доставка снарков", "Оружие со снарками HL1.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_snark", nullptr, nullptr},
+    // These names are genuine Gearbox classes, not Valve weapon reskins. They
+    // are eligible only when the active original DLL/map prepared the class.
+    {{491, "OPFOR PIPE WRENCH", "OF: трубный ключ", "Оригинальный ключ Opposing Force.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_pipewrench", nullptr, nullptr},
+    {{492, "OPFOR KNIFE", "OF: нож", "Оригинальный нож Opposing Force.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_knife", nullptr, nullptr},
+    {{493, "OPFOR GRAPPLE", "OF: язык-кошка", "Оригинальный Barnacle Grapple.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_grapple", nullptr, nullptr},
+    {{494, "OPFOR DESERT EAGLE", "OF: Desert Eagle", "Desert Eagle и доступные патроны .357.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_eagle", "ammo_357", "ammo_357"},
+    {{495, "OPFOR M249", "OF: M249", "M249 и доступные патроны 5.56.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_m249", "ammo_556", "ammo_556"},
+    {{496, "OPFOR SNIPER RIFLE", "OF: снайперская винтовка", "Винтовка M40A1 и доступные патроны 7.62.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_sniperrifle", "ammo_762", "ammo_762"},
+    {{497, "OPFOR SPORE LAUNCHER", "OF: споромёт", "Оригинальный споромёт и доступные споры.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_sporelauncher", "ammo_spore", "ammo_spore"},
+    {{498, "OPFOR SHOCK RIFLE", "OF: шоковая винтовка", "Оригинальное оружие Shock Roach.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_shockrifle", nullptr, nullptr},
+    {{499, "OPFOR DISPLACER", "OF: дезинтегратор", "Displacer и доступные энергетические батареи.", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD, 0, true, true}, "weapon_displacer", "ammo_gaussclip", "ammo_gaussclip"}
 };
 
 struct Theme {
@@ -120,7 +131,7 @@ static const Theme g_themes[CHAOS_THEME_COUNT] = {
     {"MEDIC",          "Медик",               "Регенерация здоровья", CHAOS_CAT_SURVIVAL, CHAOS_TONE_GOOD},
     {"APERTURE BLUE",  "Синий портал",        "Пытается установить синюю точку на стене перед игроком", CHAOS_CAT_PHYSICS, CHAOS_TONE_GOOD},
     {"APERTURE ORANGE","Оранжевый портал",   "Пытается установить оранжевую точку на стене перед игроком", CHAOS_CAT_PHYSICS, CHAOS_TONE_GOOD},
-    {"OPFOR KIT",      "Набор Opposing Force", "Выдаёт доступные аналоги оружия HL1", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD}
+    {"OPFOR KIT",      "Набор Opposing Force", "Подготовленное оружие OF или аналоги HL1", CHAOS_CAT_WEAPONS, CHAOS_TONE_GOOD}
 };
 
 struct Variant { const char *en; const char *ru; };

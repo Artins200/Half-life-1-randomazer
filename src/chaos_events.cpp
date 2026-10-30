@@ -20,7 +20,12 @@ static const char *const kTrackedClasses[] = {
     "weapon_9mmAR", "weapon_crossbow", "weapon_rpg", "weapon_gauss", "weapon_egon",
     "weapon_hornetgun", "weapon_handgrenade", "weapon_satchel", "weapon_tripmine", "weapon_snark",
     "ammo_9mmclip", "ammo_357", "ammo_buckshot", "ammo_9mmAR", "ammo_ARgrenades",
-    "ammo_crossbow", "ammo_rpgclip", "ammo_gaussclip", "player_weaponstrip"
+    "ammo_crossbow", "ammo_rpgclip", "ammo_gaussclip", "player_weaponstrip",
+    // Actual Opposing Force classes. Observed only if the loaded DLL/map
+    // prepared them during map loading; never precache additional resources.
+    "weapon_pipewrench", "weapon_knife", "weapon_grapple", "weapon_eagle", "weapon_m249",
+    "weapon_sniperrifle", "weapon_sporelauncher", "weapon_shockrifle", "weapon_displacer",
+    "ammo_556", "ammo_762", "ammo_spore"
 };
 static const char *const kCueSounds[] = {
     "fvox/beep.wav", "debris/beamstart7.wav", "items/suitchargeok1.wav",
@@ -124,6 +129,9 @@ ChaosManager::ChaosManager()
       m_edictCount(0),
       m_clientMax(1),
       m_serverActive(false),
+      m_networkPlayer(nullptr),
+      m_networkPlayerIndex(0),
+      m_networkPlayerSerial(0),
       m_restrictedContext(false),
       m_flLastFrameTime(0.0f),
       m_flNextChaosTime(10.0f),
@@ -273,7 +281,11 @@ void ChaosManager::OnRegUserMsg(const char *pszName, int iMsgId) {
 }
 
 void ChaosManager::OnMapPrecacheReset() {
-    if (m_serverActive) ClearAllModifiers(FindActivePlayer(), true);
+    // The previous map's client channel/edicts may already have been freed.
+    // Restore global cvars without dereferencing or messaging the old player.
+    m_networkPlayer = nullptr;
+    m_networkPlayerIndex = 0;
+    if (m_serverActive) ClearAllModifiers(nullptr, true);
     memset(m_classReady, 0, sizeof(m_classReady));
     // Engine-allocated string IDs are only valid for the map that allocated them.
     memset(m_classStringIds, 0, sizeof(m_classStringIds));
@@ -326,6 +338,9 @@ void ChaosManager::OnServerActivate(edict_t *pEdictList, int edictCount, int cli
     m_edictCount = edictCount;
     m_clientMax = (clientMax > 0) ? clientMax : 1;
     m_serverActive = true;
+    m_networkPlayer = nullptr;
+    m_networkPlayerIndex = 0;
+    m_networkPlayerSerial = 0;
 
     const char *mapName = (gpGlobals && gpGlobals->mapname) ? STRING(gpGlobals->mapname) : "";
     ResetTransientState();
@@ -367,39 +382,46 @@ void ChaosManager::OnServerActivate(edict_t *pEdictList, int edictCount, int cli
 }
 
 void ChaosManager::OnServerDeactivate() {
-    ClearAllModifiers(FindActivePlayer(), true);
+    // During load/restart the client can already be disconnected here. Even
+    // SetFOV while clearing a modifier would write to a zeroed sizebuf_t.
+    m_networkPlayer = nullptr;
+    m_networkPlayerIndex = 0;
+    ClearAllModifiers(nullptr, true);
     ResetTransientState();
     g_deathCounter.FlushNow();
     m_serverActive = false;
 }
 
 void ChaosManager::OnClientPutInServer(edict_t *pPlayer) {
+    (void)pPlayer;
     g_deathCounter.OnClientPutInServer();
-    ClearAllModifiers(pPlayer, true);
+    m_networkPlayer = nullptr;
+    m_networkPlayerIndex = 0;
+    ClearAllModifiers(nullptr, true);
     m_restrictedContext = false;
+    // ClientPutInServer happens during signon, before it completes; wait for
+    // the first real player PreThink before sending HUD or starting events.
+}
 
-    float interval = ChaosInterval();
-
-    if (gpGlobals) {
-        m_flNextChaosTime = gpGlobals->time + interval;
-        m_flNextHudRefresh = gpGlobals->time + 0.25f;
+void ChaosManager::OnClientDisconnect(edict_t *pPlayer) {
+    if (pPlayer && pPlayer == m_networkPlayer) {
+        m_networkPlayer = nullptr;
+        m_networkPlayerIndex = 0;
+        ClearAllModifiers(nullptr, true);
+        ResetTransientState();
     }
-    m_lastBeepSecond = -1;
 }
 
 edict_t *ChaosManager::FindActivePlayer() const {
-    if (!m_serverActive || !g_engfuncs.pfnPEntityOfEntIndex) {
-        return nullptr;
-    }
-    int maxCli = (gpGlobals && gpGlobals->maxClients > 0) ? gpGlobals->maxClients : m_clientMax;
-    if (maxCli < 1) maxCli = 1;
-    for (int i = 1; i <= maxCli; ++i) {
-        edict_t *pEnt = g_engfuncs.pfnPEntityOfEntIndex(i);
-        if (pEnt && !pEnt->free && (pEnt->v.flags & FL_CLIENT)) {
-            return pEnt;
-        }
-    }
-    return nullptr;
+    if (!m_serverActive || !m_networkPlayer || m_networkPlayerIndex <= 0 ||
+        !g_engfuncs.pfnPEntityOfEntIndex) return nullptr;
+    const int slots = (gpGlobals && gpGlobals->maxClients > 0) ? gpGlobals->maxClients : m_clientMax;
+    if (slots < 1 || slots > 64 || m_networkPlayerIndex > slots ||
+        (gpGlobals && gpGlobals->maxEntities > 0 && m_networkPlayerIndex >= gpGlobals->maxEntities)) return nullptr;
+    edict_t *ent = g_engfuncs.pfnPEntityOfEntIndex(m_networkPlayerIndex);
+    if (ent != m_networkPlayer || !ent || ent->free || ent->serialnumber != m_networkPlayerSerial ||
+        !(ent->v.flags & FL_CLIENT) || (ent->v.flags & FL_FAKECLIENT)) return nullptr;
+    return ent;
 }
 
 bool ChaosManager::IsIntroTramMap() const {
@@ -423,7 +445,7 @@ bool ChaosManager::IsMovementSafe(const edict_t *player) const {
 bool ChaosManager::IsChaosSessionAvailable(const edict_t *player) const {
     if (!m_serverActive || !gpGlobals || !gpGlobals->pStringBase ||
         gpGlobals->deathmatch != 0.0f || gpGlobals->coop != 0.0f ||
-        !player || player->free || !(player->v.flags & FL_CLIENT) ||
+        !player || player != FindActivePlayer() || player->free || !(player->v.flags & FL_CLIENT) ||
         player->v.deadflag != DEAD_NO || player->v.health <= 0.0f) return false;
 
     // maxClients is a slot capacity, not a player count. A local game with
@@ -466,6 +488,10 @@ bool ChaosManager::IsEventAllowed(const edict_t *player, int eventId) const {
 bool ChaosManager::HasReadyWeaponForEvent(int eventId) const {
     if (const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(eventId)) return IsClassReady(gift->weapon);
     if (eventId == 42) {
+        for (int i = 0; i < CHAOS_OPFOR_WEAPON_GIFT_COUNT; ++i) {
+            const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(CHAOS_OPFOR_WEAPON_GIFT_START + i);
+            if (gift && IsClassReady(gift->weapon)) return true;
+        }
         return IsClassReady("weapon_9mmAR") || IsClassReady("weapon_shotgun") || IsClassReady("weapon_gauss");
     }
     if (eventId != 22 && eventId != 23) return false;
@@ -1030,7 +1056,7 @@ int ChaosManager::LaunchNearbyEnemies(edict_t *pPlayer, const Vec3 &center, floa
 }
 
 void ChaosManager::PlayCueSound(edict_t *pPlayer, const char *sample, int pitch) {
-    if (!pPlayer || !sample || !IsCueReady(sample) || !g_engfuncs.pfnEmitSound) return;
+    if (!pPlayer || pPlayer != FindActivePlayer() || !sample || !IsCueReady(sample) || !g_engfuncs.pfnEmitSound) return;
     if (g_engfuncs.pfnCVarGetFloat && g_engfuncs.pfnCVarGetFloat("chaos_sound") <= 0.0f) {
         return;
     }
@@ -1038,7 +1064,7 @@ void ChaosManager::PlayCueSound(edict_t *pPlayer, const char *sample, int pitch)
 }
 
 void ChaosManager::SendHudText(edict_t *pPlayer, const hudtextparms_t &parms, const char *message, bool reliable) {
-    if (!pPlayer || !message || !g_engfuncs.pfnMessageBegin) return;
+    if (!pPlayer || pPlayer != FindActivePlayer() || !message || !g_engfuncs.pfnMessageBegin) return;
 
     const int dest = reliable ? MSG_ONE : MSG_ONE_UNRELIABLE;
     g_engfuncs.pfnMessageBegin(dest, SVC_TEMPENTITY, nullptr, pPlayer);
@@ -1073,7 +1099,7 @@ void ChaosManager::SendHudText(edict_t *pPlayer, const hudtextparms_t &parms, co
 }
 
 void ChaosManager::SendScreenShake(edict_t *pPlayer, float amplitude, float frequency, float duration) {
-    if (!pPlayer || m_msgScreenShake <= 0 || !g_engfuncs.pfnMessageBegin) return;
+    if (!pPlayer || pPlayer != FindActivePlayer() || m_msgScreenShake <= 0 || !g_engfuncs.pfnMessageBegin) return;
     g_engfuncs.pfnMessageBegin(MSG_ONE_UNRELIABLE, m_msgScreenShake, nullptr, pPlayer);
     g_engfuncs.pfnWriteShort(FixedUnsigned16(amplitude, (float)(1 << 12)));
     g_engfuncs.pfnWriteShort(FixedUnsigned16(duration, (float)(1 << 12)));
@@ -1082,7 +1108,7 @@ void ChaosManager::SendScreenShake(edict_t *pPlayer, float amplitude, float freq
 }
 
 void ChaosManager::SendScreenFade(edict_t *pPlayer, byte r, byte g, byte b, byte alpha, float fadeTime, float holdTime, int flags) {
-    if (!pPlayer || m_msgScreenFade <= 0 || !g_engfuncs.pfnMessageBegin) return;
+    if (!pPlayer || pPlayer != FindActivePlayer() || m_msgScreenFade <= 0 || !g_engfuncs.pfnMessageBegin) return;
     g_engfuncs.pfnMessageBegin(MSG_ONE_UNRELIABLE, m_msgScreenFade, nullptr, pPlayer);
     g_engfuncs.pfnWriteShort(FixedUnsigned16(fadeTime, (float)(1 << 12)));
     g_engfuncs.pfnWriteShort(FixedUnsigned16(holdTime, (float)(1 << 12)));
@@ -1095,7 +1121,7 @@ void ChaosManager::SendScreenFade(edict_t *pPlayer, byte r, byte g, byte b, byte
 }
 
 void ChaosManager::SendDynamicLight(const Vec3 &pos, int radius10, byte r, byte g, byte b, int life10, int decay10) {
-    if (!g_engfuncs.pfnMessageBegin) return;
+    if (!FindActivePlayer() || !g_engfuncs.pfnMessageBegin) return;
     // Verified GoldSrc TE_DLIGHT format: coord*3 + radius + r + g + b + life + decay (no brightness byte!)
     g_engfuncs.pfnMessageBegin(MSG_BROADCAST, SVC_TEMPENTITY, nullptr, nullptr);
     g_engfuncs.pfnWriteByte(TE_DLIGHT);
@@ -1112,7 +1138,7 @@ void ChaosManager::SendDynamicLight(const Vec3 &pos, int radius10, byte r, byte 
 }
 
 void ChaosManager::SendTeleportSplash(const Vec3 &pos) {
-    if (!g_engfuncs.pfnMessageBegin) return;
+    if (!FindActivePlayer() || !g_engfuncs.pfnMessageBegin) return;
     g_engfuncs.pfnMessageBegin(MSG_PVS, SVC_TEMPENTITY, pos, nullptr);
     g_engfuncs.pfnWriteByte(TE_TELEPORT);
     g_engfuncs.pfnWriteCoord(pos.x);
@@ -1122,7 +1148,7 @@ void ChaosManager::SendTeleportSplash(const Vec3 &pos) {
 }
 
 void ChaosManager::SendImplosion(const Vec3 &pos, int radius, int count, int life10) {
-    if (!g_engfuncs.pfnMessageBegin) return;
+    if (!FindActivePlayer() || !g_engfuncs.pfnMessageBegin) return;
     g_engfuncs.pfnMessageBegin(MSG_PVS, SVC_TEMPENTITY, pos, nullptr);
     g_engfuncs.pfnWriteByte(TE_IMPLOSION);
     g_engfuncs.pfnWriteCoord(pos.x);
@@ -1135,7 +1161,7 @@ void ChaosManager::SendImplosion(const Vec3 &pos, int radius, int count, int lif
 }
 
 void ChaosManager::SendSetFOV(edict_t *pPlayer, int fov) {
-    if (!pPlayer || m_msgSetFOV <= 0 || !g_engfuncs.pfnMessageBegin) return;
+    if (!pPlayer || pPlayer != FindActivePlayer() || m_msgSetFOV <= 0 || !g_engfuncs.pfnMessageBegin) return;
     pPlayer->v.fov = (float)fov;
     g_engfuncs.pfnMessageBegin(MSG_ONE, m_msgSetFOV, nullptr, pPlayer);
     g_engfuncs.pfnWriteByte(fov & 0xFF);
@@ -1144,14 +1170,15 @@ void ChaosManager::SendSetFOV(edict_t *pPlayer, int fov) {
 
 void ChaosManager::SendChatAndConsole(edict_t *pPlayer, const char *msg) {
     if (!msg) return;
-    if (pPlayer && g_engfuncs.pfnClientPrintf) {
+    const bool ready = pPlayer && pPlayer == FindActivePlayer();
+    if (ready && g_engfuncs.pfnClientPrintf) {
         g_engfuncs.pfnClientPrintf(pPlayer, print_console, msg);
     } else if (g_engfuncs.pfnServerPrint) {
         g_engfuncs.pfnServerPrint(msg);
     }
 
     const bool ruChat = (!g_engfuncs.pfnCVarGetFloat || g_engfuncs.pfnCVarGetFloat("chaos_ru_chat") > 0.0f);
-    if (ruChat && pPlayer && m_msgSayText > 0 && g_engfuncs.pfnMessageBegin) {
+    if (ruChat && ready && m_msgSayText > 0 && g_engfuncs.pfnMessageBegin) {
         int entIdx = g_engfuncs.pfnIndexOfEdict ? g_engfuncs.pfnIndexOfEdict(pPlayer) : 1;
         // SayText is a variable-length user message with a 255-byte wire cap.
         // Stop at a UTF-8 boundary and leave ample room for the entity byte.
@@ -1244,11 +1271,11 @@ void ChaosManager::RefreshStatusHud(edict_t *pPlayer) {
     char hudBuf[384];
     if (enabled && !IsChaosSessionAvailable(pPlayer)) {
         snprintf(hudBuf, sizeof(hudBuf),
-                 "=== HL1 CHAOS v1.2 ===\nDEATHS: %d  (MAP: %d)\nWAITING FOR SINGLE PLAYER%s",
+                 "=== HL1 CHAOS v1.3 ===\nDEATHS: %d  (MAP: %d)\nWAITING FOR SINGLE PLAYER%s",
                  g_deathCounter.GetTotalDeaths(), g_deathCounter.GetMapDeaths(), runLine);
     } else if (enabled) {
         snprintf(hudBuf, sizeof(hudBuf),
-                 "=== HL1 CHAOS v1.2 ===\n"
+                 "=== HL1 CHAOS v1.3 ===\n"
                  "DEATHS: %d  (MAP: %d)\n"
                  "NEXT: %2ds [%s]\n"
                  "LAST: %s%s%s%s%s",
@@ -1263,7 +1290,7 @@ void ChaosManager::RefreshStatusHud(edict_t *pPlayer) {
                  runLine);
     } else {
         snprintf(hudBuf, sizeof(hudBuf),
-                 "=== HL1 CHAOS v1.2 [PAUSED] ===\n"
+                 "=== HL1 CHAOS v1.3 [PAUSED] ===\n"
                  "DEATHS: %d  (MAP: %d)\n"
                  "Type chaos_toggle to resume%s",
                  g_deathCounter.GetTotalDeaths(),
@@ -1918,6 +1945,9 @@ void ChaosManager::UpdateTimedModifiers(edict_t *pPlayer) {
 
 void ChaosManager::OnStartFrame() {
     if (!m_serverActive || !gpGlobals) return;
+    // On load, an FL_CLIENT edict can exist before its netchan does. GoldSrc
+    // may run StartFrame during server activation, before client signon.
+    if (!FindActivePlayer()) return;
 
     const float now = gpGlobals->time;
     float interval = ChaosInterval();
@@ -2067,7 +2097,30 @@ void ChaosManager::AfterPlayerSave(edict_t *player, const PlayerSaveSnapshot &sn
 }
 
 void ChaosManager::OnPlayerPreThink(edict_t *pPlayer) {
-    if (!pPlayer || pPlayer->free || !m_serverActive || pPlayer != FindActivePlayer()) return;
+    if (!m_serverActive || !gpGlobals || !pPlayer || pPlayer->free ||
+        !(pPlayer->v.flags & FL_CLIENT) || (pPlayer->v.flags & FL_FAKECLIENT) ||
+        !g_engfuncs.pfnPEntityOfEntIndex) return;
+
+    if (!FindActivePlayer()) {
+        // GoldSrc calls PlayerPreThink while processing a spawned client's
+        // user command, after netchan setup. Unlike ClientPutInServer, it also
+        // occurs for a restored save (SV_WriteSpawn skips PutInServer there).
+        int slots = gpGlobals->maxClients > 0 ? gpGlobals->maxClients : m_clientMax;
+        if (slots < 1 || slots > 64 || (gpGlobals->maxEntities > 0 && slots >= gpGlobals->maxEntities)) return;
+        int index = 0;
+        for (int i = 1; i <= slots; ++i) {
+            if (g_engfuncs.pfnPEntityOfEntIndex(i) == pPlayer) { index = i; break; }
+        }
+        if (!index) return;
+        m_networkPlayer = pPlayer;
+        m_networkPlayerIndex = index;
+        m_networkPlayerSerial = pPlayer->serialnumber;
+        m_flLastFrameTime = gpGlobals->time;
+        m_flNextChaosTime = gpGlobals->time + ChaosInterval();
+        m_flNextHudRefresh = gpGlobals->time + 0.1f;
+        m_lastBeepSecond = -1;
+    }
+    if (pPlayer != FindActivePlayer()) return;
     if (g_deathCounter.CheckPlayerState(pPlayer)) {
         ClearAllModifiers(pPlayer, true);
         ResetTransientState();
@@ -2243,7 +2296,8 @@ void ChaosManager::CmdRecover() {
 void ChaosManager::CmdPrintList(edict_t *pPlayer, int page) {
     if (!pPlayer) pPlayer = FindActivePlayer();
     auto printLine = [&](const char *line) {
-        if (pPlayer && g_engfuncs.pfnClientPrintf) g_engfuncs.pfnClientPrintf(pPlayer, print_console, line);
+        if (pPlayer && pPlayer == FindActivePlayer() && g_engfuncs.pfnClientPrintf)
+            g_engfuncs.pfnClientPrintf(pPlayer, print_console, line);
         else if (g_engfuncs.pfnServerPrint) g_engfuncs.pfnServerPrint(line);
     };
     const int perPage = 25;
@@ -2267,7 +2321,7 @@ void ChaosManager::CmdPrintStatus(edict_t *pPlayer) {
     if (!pPlayer) pPlayer = FindActivePlayer();
     char buf[256];
     snprintf(buf, sizeof(buf),
-             "[ХАОС v1.2] Смертей всего: %d | На этой карте: %d | Пережито событий: %d | До след. события: %.1f сек\n",
+             "[ХАОС v1.3] Смертей всего: %d | На этой карте: %d | Пережито событий: %d | До след. события: %.1f сек\n",
              g_deathCounter.GetTotalDeaths(),
              g_deathCounter.GetMapDeaths(),
              g_deathCounter.GetTotalEvents(),
