@@ -70,6 +70,10 @@ static bool g_precacheCues = true;
 static bool g_precacheStockSnark = true;
 static bool g_precacheStockWeapons = true;
 static bool g_precacheOpforWeapons = false;
+// GoldSrc strings are 32-bit offsets, not signed indices. An original game
+// DLL literal may yield a value whose high bit is set (a negative int).
+static bool g_useHighBitPrecacheOffsets = false;
+static const char *g_mockHighBitClassName = nullptr;
 static const char *g_stockWeaponFilter = nullptr;
 static int g_emittedSounds = 0;
 static int g_sphereSearchCalls = 0;
@@ -187,7 +191,7 @@ static int Mock_PointContents(const float *rgflVector) {
 }
 
 static edict_t *Mock_CreateNamedEntity(int className) {
-    const char *cls = &g_stringPool[className];
+    const char *cls = g_mockHighBitClassName ? g_mockHighBitClassName : &g_stringPool[className];
     for (int i = 2; i < 128; ++i) {
         if (g_edicts[i].free) {
             memset((void *)&g_edicts[i], 0, sizeof(edict_t));
@@ -455,6 +459,25 @@ static void Orig_GameInit(void) {
     g_msgIdSay   = Mock_RegUserMsg("SayText", -1);
 }
 
+static edict_t *Mock_WorldPrecacheEntity(const char *name) {
+    const int allocated = Mock_AllocString(name);
+    if (!g_useHighBitPrecacheOffsets)
+        return g_testHookedEngine->pfnCreateNamedEntity(allocated);
+
+    // Model MAKE_STRING(literal) in a real 32-bit game DLL. The engine has
+    // accepted this valid name even though its uint32 offset looks negative
+    // when passed as the int parameter of pfnCreateNamedEntity.
+    const int highBitOffset = INT32_MIN + 16;
+    const char *savedBase = g_mockGlobals.pStringBase;
+    g_mockGlobals.pStringBase = reinterpret_cast<const char *>(
+        reinterpret_cast<uintptr_t>(&g_stringPool[allocated]) - (uint32_t)highBitOffset);
+    g_mockHighBitClassName = name;
+    edict_t *result = g_testHookedEngine->pfnCreateNamedEntity(highBitOffset);
+    g_mockHighBitClassName = nullptr;
+    g_mockGlobals.pStringBase = savedBase;
+    return result;
+}
+
 static int Orig_Spawn(edict_t *pent) {
     if (!pent) return -1;
     const char *cls = &g_stringPool[pent->v.classname];
@@ -475,8 +498,7 @@ static int Orig_Spawn(edict_t *pent) {
             if (!g_precacheStockSnark && strcmp(name, "monster_snark") == 0) continue;
             if (strncmp(name, "weapon_", 7) == 0 &&
                 (!g_precacheStockWeapons || (g_stockWeaponFilter && strcmp(name, g_stockWeaponFilter) != 0))) continue;
-            int stringId = Mock_AllocString(name);
-            edict_t *e = g_testHookedEngine->pfnCreateNamedEntity(stringId);
+            edict_t *e = Mock_WorldPrecacheEntity(name);
             assert(e);
             g_precachedClasses.insert(name);
             Mock_RemoveEntity(e);
@@ -486,7 +508,7 @@ static int Orig_Spawn(edict_t *pent) {
                 "weapon_sniperrifle", "weapon_sporelauncher", "weapon_shockrifle", "weapon_displacer",
                 "ammo_556", "ammo_762", "ammo_spore"};
             for (const char *name : opfor) {
-                edict_t *e = g_testHookedEngine->pfnCreateNamedEntity(Mock_AllocString(name));
+                edict_t *e = Mock_WorldPrecacheEntity(name);
                 assert(e);
                 g_precachedClasses.insert(name);
                 Mock_RemoveEntity(e);
@@ -696,18 +718,68 @@ static void TestRestoreAndDisconnectLifecycle(DLL_FUNCTIONS &dll) {
     Mock_CVarSetFloat("chaos_enabled", 1);
 }
 
+static bool Contains(const std::vector<std::string> &lines, const char *text);
+
 static void TestOpforWeaponDelivery(DLL_FUNCTIONS &dll) {
     printf("[opfor] Valve rejects unprepared OF classes; Gearbox-style precache enables nine deliveries...\n");
     Mock_CVarSetFloat("chaos_enabled", 0);
     g_precacheOpforWeapons = false;
+    StartWorld(dll, "c1a2", 1, false);
+    g_consoleOutput.clear();
+    g_chaos.CmdTriggerById(494);
+    assert(Contains(g_consoleOutput, "костюм HEV"));
+
+    StartWorld(dll, "c0a0", 1, true);
+    g_consoleOutput.clear();
+    g_chaos.CmdTriggerById(494);
+    assert(Contains(g_consoleOutput, "вступительной карте"));
+
     StartWorld(dll, "c1a2", 1, true);
+    g_edicts[1].v.flags |= FL_ONTRAIN;
+    g_consoleOutput.clear();
+    g_chaos.CmdTriggerById(494);
+    assert(Contains(g_consoleOutput, "транспорта"));
+    g_edicts[1].v.flags &= ~FL_ONTRAIN;
+    g_consoleOutput.clear();
     g_receivedItems.clear();
     int before = g_deathCounter.GetTotalEvents();
     for (int id = CHAOS_OPFOR_WEAPON_GIFT_START; id < CHAOS_EVENT_COUNT; ++id) g_chaos.CmdTriggerById(id);
     assert(g_deathCounter.GetTotalEvents() == before && g_receivedItems.empty());
+    assert(Contains(g_consoleOutput, "weapon_eagle") && Contains(g_consoleOutput, "не подготовлен"));
+
+    // Null, free or uninitialized precache entities must never mark a class
+    // as ready, even when its string has the high bit set.
+    const int eagleString = Mock_AllocString("weapon_eagle");
+    const int highBitOffset = INT32_MIN + 16;
+    const char *savedBase = g_mockGlobals.pStringBase;
+    g_mockGlobals.pStringBase = reinterpret_cast<const char *>(
+        reinterpret_cast<uintptr_t>(&g_stringPool[eagleString]) - (uint32_t)highBitOffset);
+    edict_t freed = {}, noPrivate = {}, initialized = {};
+    freed.free = TRUE; freed.pvPrivateData = &freed;
+    initialized.pvPrivateData = &initialized;
+    g_chaos.OnWorldPrecacheBegin();
+    g_chaos.OnWorldEntityCreated(highBitOffset, nullptr);
+    g_chaos.OnWorldEntityCreated(highBitOffset, &freed);
+    g_chaos.OnWorldEntityCreated(highBitOffset, &noPrivate);
+    g_chaos.OnWorldEntityCreated(0, &initialized);
+    g_chaos.OnWorldPrecacheEnd();
+    g_mockGlobals.pStringBase = savedBase;
+    g_consoleOutput.clear();
+    g_chaos.CmdTriggerById(494);
+    assert(g_deathCounter.GetTotalEvents() == before && Contains(g_consoleOutput, "не подготовлен"));
 
     g_precacheOpforWeapons = true;
+    // In the real DLL, MAKE_STRING may produce an int with the high bit set.
+    // Those resource classes must still be recognized and delivered.
+    g_useHighBitPrecacheOffsets = true;
     StartWorld(dll, "c1a2", 1, true);
+    g_useHighBitPrecacheOffsets = false;
+    const int oldMaxEntities = g_mockGlobals.maxEntities;
+    g_mockGlobals.maxEntities = 16;
+    g_consoleOutput.clear();
+    g_chaos.CmdTriggerById(494);
+    assert(Contains(g_consoleOutput, "Недостаточно свободных игровых сущностей"));
+    g_mockGlobals.maxEntities = oldMaxEntities;
     for (int id = CHAOS_OPFOR_WEAPON_GIFT_START; id < CHAOS_EVENT_COUNT; ++id) {
         const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(id);
         assert(gift);

@@ -28,14 +28,34 @@ typedef int (*ProbeFn)();
 static int soundCalls = 0;
 static edict_t *activePlayer = nullptr;
 static edict_t *worldEdict = nullptr;
+static edict_t pickupEdict = {};
+static globalvars_t *engineGlobals = nullptr;
+static const char stringPool[] = "\0worldspawn\0c0a0\0c1a0\0weapon_eagle\0";
 static int sphereSearchCalls = 0;
 static const char *triggerId = "14";
 static int eventBanners = 0, countdowns = 0, oldSafeMode = 0, fixedVersionHud = 0;
 static bool clientBufferInitialized = true;
 static int PrecacheSound(char *) { ++soundCalls; return 1; }
-static edict_t *EntityOfIndex(int index) { return index == 1 ? activePlayer : nullptr; }
-static int IndexOfEdict(const edict_t *edict) { return edict == activePlayer ? 1 : 0; }
+static edict_t *EntityOfIndex(int index) {
+    return index == 1 ? activePlayer : (index == 2 && !pickupEdict.free ? &pickupEdict : nullptr);
+}
+static int IndexOfEdict(const edict_t *edict) { return edict == activePlayer ? 1 : (edict == &pickupEdict ? 2 : 0); }
 static int EntOffsetOfPEntity(const edict_t *edict) { return IndexOfEdict(edict) * (int)sizeof(edict_t); }
+static int AllocString(const char *name) { return name && strcmp(name, "weapon_eagle") == 0 ? 22 : 0; }
+static edict_t *CreateNamedEntity(int classname) {
+    assert(engineGlobals && engineGlobals->pStringBase);
+    const char *name = reinterpret_cast<const char *>(
+        reinterpret_cast<uintptr_t>(engineGlobals->pStringBase) + (uint32_t)classname);
+    assert(strcmp(name, "weapon_eagle") == 0);
+    memset(&pickupEdict, 0, sizeof(pickupEdict));
+    pickupEdict.v.classname = (string_t)classname;
+    pickupEdict.v.pContainingEntity = &pickupEdict;
+    pickupEdict.v.solid = SOLID_TRIGGER;
+    pickupEdict.pvPrivateData = &pickupEdict;
+    return &pickupEdict;
+}
+static void RemoveEntity(edict_t *entity) { if (entity) entity->free = TRUE; }
+static int NumberOfEntities() { return pickupEdict.free ? 2 : 3; }
 static edict_t *FindEntityInSphere(edict_t *start, const float *, float) {
     assert(start != worldEdict && "searched past the GoldSrc worldspawn sentinel");
     ++sphereSearchCalls;
@@ -64,7 +84,7 @@ static void WriteString(const char *s) {
     if (strstr(s, ">>> RANDOM EVENT #")) ++eventBanners;
     if (strstr(s, "NEXT:")) ++countdowns;
     if (strstr(s, "STORY / VEHICLE SAFE MODE")) ++oldSafeMode;
-    if (strstr(s, "HL1 CHAOS v1.3")) ++fixedVersionHud;
+    if (strstr(s, "HL1 CHAOS v1.3.1")) ++fixedVersionHud;
 }
 static int CmdArgc() { return 2; }
 static const char *CmdArgv(int n) { return n == 0 ? "chaos_trigger" : triggerId; }
@@ -92,6 +112,10 @@ int main(int argc, char **argv) {
     engine.pfnPEntityOfEntIndex = EntityOfIndex;
     engine.pfnEntOffsetOfPEntity = EntOffsetOfPEntity;
     engine.pfnIndexOfEdict = IndexOfEdict;
+    engine.pfnAllocString = AllocString;
+    engine.pfnCreateNamedEntity = CreateNamedEntity;
+    engine.pfnRemoveEntity = RemoveEntity;
+    engine.pfnNumberOfEntities = NumberOfEntities;
     engine.pfnFindEntityInSphere = FindEntityInSphere;
     engine.pfnRegUserMsg = RegisterUserMsg;
     engine.pfnCVarGetFloat = CVarGetFloat;
@@ -103,9 +127,10 @@ int main(int argc, char **argv) {
     engine.pfnWriteString = WriteString;
     engine.pfnCmd_Argc = CmdArgc;
     engine.pfnCmd_Argv = CmdArgv;
-    const char pool[] = "\0worldspawn\0c0a0\0c1a0\0";
     globalvars_t globals = {};
-    globals.pStringBase = pool;
+    globals.pStringBase = stringPool;
+    engineGlobals = &globals;
+    pickupEdict.free = TRUE;
     give(&engine, &globals);
     DLL_FUNCTIONS dll = {};
     int version = INTERFACE_VERSION;
@@ -244,6 +269,21 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Bomb smoke test: sphere calls=%d, hp=%g, velocity.z=%g\n",
                 sphereSearchCalls, (double)player.v.health, (double)player.v.velocity.z);
     assert(sphereSearchCalls == 2 && player.v.health == 85 && player.v.velocity.z > 0);
+
+    if (opforProfile) {
+        // The loaded DLL must recognize the high-bit class created by the
+        // fake Gearbox worldspawn, then deliver it via the original Touch.
+        player.v.weapons |= (1u << WEAPON_SUIT);
+        triggerId = "494";
+        int previousBanners = eventBanners;
+        globals.time += 0.4f;
+        dll.pfnClientCommand(&player);
+        assert(eventBanners == previousBanners + 1);
+        globals.time += 0.3f;
+        dll.pfnPlayerPreThink(&player);
+        dll.pfnStartFrame();
+        assert((player.v.weapons & (1 << 5)) != 0);
+    }
     dll.pfnServerDeactivate();
     activePlayer = nullptr;
     worldEdict = nullptr;
@@ -287,16 +327,23 @@ int main(int argc, char **argv) {
     assert(original);
     ProbeFn init = (ProbeFn)FindModuleSymbol(original, "fake_init_calls");
     ProbeFn spawn = (ProbeFn)FindModuleSymbol(original, "fake_spawn_calls");
+    ProbeFn pickup = (ProbeFn)FindModuleSymbol(original, "fake_pickup_calls");
     ProbeFn fallback = (ProbeFn)FindModuleSymbol(original, "fake_has_legacy_fallback");
     ProbeFn save = (ProbeFn)FindModuleSymbol(original, "fake_save_calls");
     ProbeFn restore = (ProbeFn)FindModuleSymbol(original, "fake_restore_calls");
     ProbeFn roundtrip = (ProbeFn)FindModuleSymbol(original, "fake_function_roundtrip");
-    assert(init && spawn && fallback && save && restore && roundtrip);
-    assert(init() == 1 && spawn() == 1 && fallback() == 1 && save() == 2 && restore() == 1);
+    assert(init && spawn && pickup && fallback && save && restore && roundtrip);
+    assert(init() == 1 && spawn() == (opforProfile ? 2 : 1) && pickup() == (opforProfile ? 1 : 0) &&
+           fallback() == 1 && save() == 2 && restore() == 1);
     if (sizeof(void *) == 4) assert(roundtrip() == 1);
     CloseModule(original);
     CloseModule(proxy);
-    puts(sizeof(void *) == 4 ? "[OK] Shipped x86 proxy forwards, runs intro chaos and detonates bomb" :
-                              "[OK] Proxy forwards, runs intro chaos and detonates bomb");
+    if (opforProfile) {
+        puts(sizeof(void *) == 4 ? "[OK] Shipped x86 OF proxy forwards and delivers a high-bit precached weapon" :
+                                  "[OK] OF proxy forwards and delivers a high-bit precached weapon");
+    } else {
+        puts(sizeof(void *) == 4 ? "[OK] Shipped x86 proxy forwards, runs intro chaos and detonates bomb" :
+                                  "[OK] Proxy forwards, runs intro chaos and detonates bomb");
+    }
     return 0;
 }

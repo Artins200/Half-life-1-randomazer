@@ -297,9 +297,12 @@ void ChaosManager::OnWorldPrecacheBegin() { m_inWorldPrecache = true; }
 void ChaosManager::OnWorldPrecacheEnd() { m_inWorldPrecache = false; }
 
 void ChaosManager::OnWorldEntityCreated(int classname, edict_t *entity) {
+    // The engine's string_t is a 32-bit unsigned offset, even though
+    // pfnCreateNamedEntity takes int. MAKE_STRING of a DLL literal may set
+    // the high bit, so a negative int is valid; only zero is the null string.
     if (!m_inWorldPrecache || !entity || entity->free || !entity->pvPrivateData ||
-        !gpGlobals || !gpGlobals->pStringBase || classname <= 0) return;
-    const char *name = STRING(classname);
+        !gpGlobals || !gpGlobals->pStringBase || classname == 0) return;
+    const char *name = STRING((string_t)classname);
     // Valve's W_Precache precaches these stock items/weapons and snarks.
     if (strncmp(name, "weapon_", 7) && strncmp(name, "ammo_", 5) &&
         strcmp(name, "item_suit") && strcmp(name, "item_battery") &&
@@ -1271,11 +1274,11 @@ void ChaosManager::RefreshStatusHud(edict_t *pPlayer) {
     char hudBuf[384];
     if (enabled && !IsChaosSessionAvailable(pPlayer)) {
         snprintf(hudBuf, sizeof(hudBuf),
-                 "=== HL1 CHAOS v1.3 ===\nDEATHS: %d  (MAP: %d)\nWAITING FOR SINGLE PLAYER%s",
+                 "=== HL1 CHAOS v1.3.1 ===\nDEATHS: %d  (MAP: %d)\nWAITING FOR SINGLE PLAYER%s",
                  g_deathCounter.GetTotalDeaths(), g_deathCounter.GetMapDeaths(), runLine);
     } else if (enabled) {
         snprintf(hudBuf, sizeof(hudBuf),
-                 "=== HL1 CHAOS v1.3 ===\n"
+                 "=== HL1 CHAOS v1.3.1 ===\n"
                  "DEATHS: %d  (MAP: %d)\n"
                  "NEXT: %2ds [%s]\n"
                  "LAST: %s%s%s%s%s",
@@ -1290,7 +1293,7 @@ void ChaosManager::RefreshStatusHud(edict_t *pPlayer) {
                  runLine);
     } else {
         snprintf(hudBuf, sizeof(hudBuf),
-                 "=== HL1 CHAOS v1.3 [PAUSED] ===\n"
+                 "=== HL1 CHAOS v1.3.1 [PAUSED] ===\n"
                  "DEATHS: %d  (MAP: %d)\n"
                  "Type chaos_toggle to resume%s",
                  g_deathCounter.GetTotalDeaths(),
@@ -2232,7 +2235,29 @@ void ChaosManager::CmdTriggerById(int eventId) {
         return;
     }
     if (!IsEventAllowed(pPlayer, eventId)) {
-        SendChatAndConsole(pPlayer, "[ХАОС] Это событие недоступно: транспорт, HEV или ресурсы. Другие события продолжаются.\n");
+        const ChaosEventDef *event = ChaosGetEventDef(eventId);
+        const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(eventId);
+        if (event && event->requiresSuit && !PlayerHasSuit(pPlayer)) {
+            SendChatAndConsole(pPlayer, "[ХАОС] Для этого события нужен полученный костюм HEV/PCV.\n");
+        } else if (event && event->skipOnTram && IsIntroTramMap()) {
+            SendChatAndConsole(pPlayer, "[ХАОС] Это событие недоступно на вступительной карте.\n");
+        } else if (event && event->skipOnTram && IsRestrictedState(pPlayer)) {
+            SendChatAndConsole(pPlayer, "[ХАОС] Выйдите из транспорта, лестницы или сценарного управления.\n");
+        } else if (gift && !IsClassReady(gift->weapon)) {
+            char message[200];
+            if (eventId >= CHAOS_OPFOR_WEAPON_GIFT_START)
+                snprintf(message, sizeof(message), "[ХАОС] Класс %s не подготовлен этой картой/игрой. Для оружия OF нужен профиль Opposing Force.\n", gift->weapon);
+            else
+                snprintf(message, sizeof(message), "[ХАОС] Класс %s не подготовлен этой картой/игрой.\n", gift->weapon);
+            SendChatAndConsole(pPlayer, message);
+        } else if ((eventId == 22 || eventId == 23 || eventId == 42) && !HasReadyWeaponForEvent(eventId)) {
+            SendChatAndConsole(pPlayer, "[ХАОС] Нет подготовленного оружия для этого события.\n");
+        } else if ((gift || eventId == 22 || eventId == 23 || eventId == 42) &&
+                   gpGlobals && gpGlobals->maxEntities > 0 && g_engfuncs.pfnNumberOfEntities && !HasEntityHeadroom()) {
+            SendChatAndConsole(pPlayer, "[ХАОС] Недостаточно свободных игровых сущностей для выдачи оружия.\n");
+        } else {
+            SendChatAndConsole(pPlayer, "[ХАОС] Событие сейчас недоступно; другие события продолжаются.\n");
+        }
         return;
     }
     if (gpGlobals && gpGlobals->time < m_nextManualEventTime) return;
@@ -2321,7 +2346,7 @@ void ChaosManager::CmdPrintStatus(edict_t *pPlayer) {
     if (!pPlayer) pPlayer = FindActivePlayer();
     char buf[256];
     snprintf(buf, sizeof(buf),
-             "[ХАОС v1.3] Смертей всего: %d | На этой карте: %d | Пережито событий: %d | До след. события: %.1f сек\n",
+             "[ХАОС v1.3.1] Смертей всего: %d | На этой карте: %d | Пережито событий: %d | До след. события: %.1f сек\n",
              g_deathCounter.GetTotalDeaths(),
              g_deathCounter.GetMapDeaths(),
              g_deathCounter.GetTotalEvents(),
