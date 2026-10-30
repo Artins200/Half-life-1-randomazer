@@ -689,6 +689,7 @@ typedef struct {
 
 #define WEAPON_SUIT         31
 #define SF_NORESPAWN        (1 << 30) // Valve cbase.h: never respawn an item
+#define SF_MONSTER_FADECORPSE (1 << 9) // Valve monsters.h: fade spawned NPC corpses
 
 // Compile-time x86 GoldSrc ABI layout checks
 #if INTPTR_MAX == INT32_MAX

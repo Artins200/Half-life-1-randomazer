@@ -16,10 +16,23 @@
 #define CHAOS_EXTRA_EVENT_COUNT 1
 #define CHAOS_EXTENSION_START (CHAOS_RECIPE_END + CHAOS_EXTRA_EVENT_COUNT)
 #define CHAOS_EXTRA_VARIANT_COUNT 2
-#define CHAOS_EVENT_COUNT (CHAOS_EXTENSION_START + CHAOS_THEME_COUNT * CHAOS_EXTRA_VARIANT_COUNT)
+#define CHAOS_EXTENSION_END (CHAOS_EXTENSION_START + CHAOS_THEME_COUNT * CHAOS_EXTRA_VARIANT_COUNT)
+// Separate weapon events are appended; existing IDs and binds keep their meaning.
+#define CHAOS_WEAPON_GIFT_START CHAOS_EXTENSION_END
+#define CHAOS_WEAPON_GIFT_COUNT 14
+#define CHAOS_EVENT_COUNT (CHAOS_WEAPON_GIFT_START + CHAOS_WEAPON_GIFT_COUNT)
+
+struct ChaosWeaponGiftDef {
+    ChaosEventDef event;
+    const char *weapon;
+    const char *ammo;
+    const char *bonusAmmo;
+};
 
 const ChaosEventDef *ChaosGetEventDef(int id);
+const ChaosWeaponGiftDef *ChaosGetWeaponGift(int id);
 int ChaosRecipeTheme(int id);
 int ChaosRecipeVariant(int id);
+bool ChaosRecipeAllowedAutomatically(int id, bool restricted);
 
 #endif

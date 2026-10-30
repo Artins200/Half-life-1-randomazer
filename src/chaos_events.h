@@ -70,6 +70,7 @@ private:
     bool SyncSafetyContext(edict_t *player);
     bool IsEventAllowed(const edict_t *player, int eventId) const;
     bool IsEventAllowedInSession(const edict_t *player, int eventId) const;
+    bool HasReadyWeaponForEvent(int eventId) const;
     bool IsMovementSafe(const edict_t *player) const;
     int CountChaosEntities() const;
     bool HasEntityHeadroom() const;
@@ -117,7 +118,7 @@ private:
     void UpdateItemQueue(edict_t *pPlayer);
     void ClearItemQueue();
     void StripPlayerWeapons(edict_t *pPlayer);
-    int LaunchNearbyEnemies(edict_t *pPlayer, float radius, float upwardVel);
+    int LaunchNearbyEnemies(edict_t *pPlayer, const Vec3 &center, float radius, float upwardVel);
 
     // Visual, sound & HUD helpers
     void PlayCueSound(edict_t *pPlayer, const char *sample, int pitch = PITCH_NORM);

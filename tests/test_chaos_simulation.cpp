@@ -64,9 +64,14 @@ static bool g_blockHull = false;
 static bool g_blockPath = false;
 static bool g_dangerAtFeet = false;
 static int g_pointContents = CONTENTS_EMPTY;
+static int g_seenHullTypes = 0;
 static bool g_mapValid = true;
 static bool g_precacheCues = true;
+static bool g_precacheStockSnark = true;
+static bool g_precacheStockWeapons = true;
+static const char *g_stockWeaponFilter = nullptr;
 static int g_emittedSounds = 0;
+static int g_sphereSearchCalls = 0;
 static const enginefuncs_t *g_testHookedEngine = nullptr;
 static entvars_t g_savedPlayerVars;
 static bool g_mutateFlagsDuringSave = false;
@@ -143,7 +148,8 @@ static void Mock_TraceLine(const float *v1, const float *v2, int fNoMonsters, ed
 }
 
 static void Mock_TraceHull(const float *v1, const float *v2, int fNoMonsters, int hullNumber, edict_t *pentToSkip, TraceResult *ptr) {
-    (void)fNoMonsters; (void)hullNumber; (void)pentToSkip;
+    (void)fNoMonsters; (void)pentToSkip;
+    if (hullNumber >= 0 && hullNumber <= 3) g_seenHullTypes |= 1 << hullNumber;
     memset((void *)ptr, 0, sizeof(*ptr));
     if (g_blockHull && v1[0] == v2[0] && v1[1] == v2[1] && v1[2] == v2[2]) {
         ptr->fStartSolid = TRUE;
@@ -153,10 +159,13 @@ static void Mock_TraceHull(const float *v1, const float *v2, int fNoMonsters, in
         ptr->flFraction = 0.4f; // a closed door across a horizontal path
         return;
     }
-    // Simulate floor at z = 0
-    if (v2[2] < 0.0f && v1[2] >= 0.0f) {
-        ptr->flFraction = v1[2] / (v1[2] - v2[2]);
-        ptr->vecEndPos = Vec3(v1[0], v1[1], 0.0f);
+    // GoldSrc traces a centered hull. Its reference point stops one half
+    // height above the floor, rather than at z=0 for every hull size.
+    float halfHeight = hullNumber == human_hull ? 36.0f :
+                       (hullNumber == large_hull ? 32.0f : (hullNumber == head_hull ? 18.0f : 0.0f));
+    if (v2[2] < halfHeight && v1[2] >= halfHeight) {
+        ptr->flFraction = (v1[2] - halfHeight) / (v1[2] - v2[2]);
+        ptr->vecEndPos = Vec3(v1[0], v1[1], halfHeight);
     } else {
         ptr->flFraction = 1.0f;
         ptr->vecEndPos = Vec3(v2[0], v2[1], v2[2]);
@@ -169,7 +178,7 @@ static int Mock_DropToFloor(edict_t *e) {
 }
 
 static int Mock_PointContents(const float *rgflVector) {
-    if (g_dangerAtFeet && rgflVector[2] < 0.0f) return CONTENTS_WATER;
+    if (g_dangerAtFeet && rgflVector[2] < 10.0f) return CONTENTS_WATER;
     return g_pointContents;
 }
 
@@ -258,11 +267,15 @@ static void Mock_ServerCommand(char *str) {
 }
 static int Mock_IsMapValid(char *name) { return g_mapValid && name && strcmp(name, "c1a1") == 0; }
 static edict_t *Mock_FindEntityInSphere(edict_t *start, const float *org, float radius) {
+    // GoldSrc returns worldspawn (edict 0), NOT nullptr, when there are no
+    // more matches. Continuing from it would restart the search forever.
+    assert(start != &g_edicts[0] && "sphere search continued past the worldspawn sentinel");
+    ++g_sphereSearchCalls;
     int first = start ? (int)(start - g_edicts) + 1 : 1;
     Vec3 center(org[0], org[1], org[2]);
     for (int i = first; i < g_numEdicts; ++i)
         if (!g_edicts[i].free && (g_edicts[i].v.origin - center).Length() <= radius) return &g_edicts[i];
-    return nullptr;
+    return &g_edicts[0];
 }
 static void Mock_ServerExecute(void) {}
 static void Mock_ClientCommand(edict_t *pEdict, char *szFmt, ...) { (void)pEdict; (void)szFmt; }
@@ -305,6 +318,10 @@ static void Mock_MessageEnd(void) {
             }
         } else if (g_curMsg.firstByte == TE_DLIGHT) {
             assert(g_curMsg.byteCount == 13 && "TE_DLIGHT must be exactly 13 bytes!");
+        } else if (g_curMsg.firstByte == TE_IMPLOSION) {
+            assert(g_curMsg.byteCount == 10 && "TE_IMPLOSION must be exactly 10 bytes!");
+        } else if (g_curMsg.firstByte == TE_TELEPORT) {
+            assert(g_curMsg.byteCount == 7 && "TE_TELEPORT must be exactly 7 bytes!");
         }
     } else if (g_curMsg.type == g_msgIdShake) {
         assert(g_curMsg.byteCount == 6 && "ScreenShake must be 6 bytes!");
@@ -448,6 +465,9 @@ static int Orig_Spawn(edict_t *pent) {
             "items/medshot4.wav", "items/gunpickup2.wav", "items/weapondrop1.wav",
             "items/suitchargeno1.wav", "debris/zap4.wav", "buttons/button3.wav", "buttons/button10.wav"};
         for (const char *name : stock) {
+            if (!g_precacheStockSnark && strcmp(name, "monster_snark") == 0) continue;
+            if (strncmp(name, "weapon_", 7) == 0 &&
+                (!g_precacheStockWeapons || (g_stockWeaponFilter && strcmp(name, g_stockWeaponFilter) != 0))) continue;
             int stringId = Mock_AllocString(name);
             edict_t *e = g_testHookedEngine->pfnCreateNamedEntity(stringId);
             assert(e);
@@ -627,6 +647,274 @@ static void WriteText(const char *path, const char *text) {
     assert(fclose(fp) == 0);
 }
 
+static edict_t *Mock_StuckSphereSearch(edict_t *, const float *, float) {
+    ++g_sphereSearchCalls;
+    return &g_edicts[2]; // a broken engine returning the same edict forever
+}
+
+static void TestBombSearchAndBlast(DLL_FUNCTIONS &dll) {
+    printf("[3a] Bomb and disco stop at GoldSrc worldspawn; blast is bounded...\n");
+    Mock_CVarSetFloat("chaos_enabled", 0);
+    StartWorld(dll, "c1a2", 1, true);
+    Mock_RemoveEntity(&g_edicts[2]); // no launchable enemies, only a named scientist
+    g_sphereSearchCalls = 0;
+    g_chaos.CmdTriggerById(27);
+    Step(dll, 2.8f);
+    assert(g_sphereSearchCalls == 0); // the fuse has not expired
+    Step(dll, 0.4f);
+    assert(g_sphereSearchCalls > 0 && g_sphereSearchCalls <= g_numEdicts + 1);
+    assert(g_edicts[1].v.health == 85 && g_edicts[1].v.velocity.z > 0);
+    assert(g_edicts[3].v.velocity.Length() == 0 && g_edicts[3].v.health == 20);
+    const int afterExplosion = g_sphereSearchCalls;
+    Step(dll, 4);
+    assert(g_sphereSearchCalls == afterExplosion); // detonates only once
+
+    // The shockwave is centered on the original bomb, not the player's new
+    // position after moving away during the fuse.
+    StartWorld(dll, "c1a2", 1, true);
+    g_edicts[2].v.origin = Vec3(200, 200, 36);
+    edict_t *farEnemy = Mock_CreateNamedEntity(Mock_AllocString("monster_zombie"));
+    assert(farEnemy);
+    farEnemy->v.origin = Vec3(800, 200, 36);
+    g_chaos.CmdTriggerById(27);
+    g_edicts[1].v.origin = Vec3(800, 200, 36);
+    Step(dll, 3.4f);
+    assert(g_edicts[2].v.velocity.z == 480 && farEnemy->v.velocity.z == 0);
+    assert(g_edicts[1].v.health == 100 && g_edicts[1].v.velocity.Length() == 0);
+    assert(g_edicts[3].v.velocity.Length() == 0);
+
+    StartWorld(dll, "c1a2", 1, true);
+    edict_t *named = Mock_CreateNamedEntity(Mock_AllocString("monster_zombie"));
+    assert(named);
+    named->v.targetname = Mock_AllocString("important_script_character");
+    named->v.origin = Vec3(210, 200, 36);
+    for (int i = 0; i < 9; ++i) {
+        edict_t *enemy = Mock_CreateNamedEntity(Mock_AllocString("monster_zombie"));
+        assert(enemy);
+        enemy->v.origin = Vec3(200 + (float)i, 200, 36);
+    }
+    g_chaos.CmdTriggerById(27); Step(dll, 3.4f);
+    int launched = 0;
+    for (int i = 2; i < g_numEdicts; ++i)
+        if (!g_edicts[i].free && g_edicts[i].v.velocity.z == 480) ++launched;
+    assert(launched == 8 && named->v.velocity.Length() == 0 && g_edicts[3].v.velocity.Length() == 0);
+
+    // All routes to the shared bomb implementation, plus the disco event.
+    const int bombIds[] = {43, CHAOS_RECIPE_START + 2 * CHAOS_VARIANT_COUNT,
+                           CHAOS_RECIPE_START + 14 * CHAOS_VARIANT_COUNT};
+    for (int id : bombIds) {
+        StartWorld(dll, "c1a2", 1, true);
+        g_sphereSearchCalls = 0;
+        g_chaos.CmdTriggerById(id); Step(dll, 3.4f);
+        assert(g_sphereSearchCalls > 0 && g_sphereSearchCalls <= g_numEdicts + 1);
+    }
+    StartWorld(dll, "c1a2", 1, true);
+    g_sphereSearchCalls = 0;
+    g_chaos.CmdTriggerById(37);
+    assert(g_sphereSearchCalls > 0 && g_sphereSearchCalls <= g_numEdicts + 1);
+
+    // IndexOfEdict is a valid world-sentinel fallback if EntOffset is absent.
+    StartWorld(dll, "c1a2", 1, true);
+    auto offset = g_engfuncs.pfnEntOffsetOfPEntity;
+    g_engfuncs.pfnEntOffsetOfPEntity = nullptr;
+    g_sphereSearchCalls = 0;
+    g_chaos.CmdTriggerById(27); Step(dll, 3.4f);
+    assert(g_sphereSearchCalls > 0 && g_sphereSearchCalls <= g_numEdicts + 1);
+    g_engfuncs.pfnEntOffsetOfPEntity = offset;
+
+    // Defensive termination even if an engine/mod repeatedly returns one edict.
+    StartWorld(dll, "c1a2", 1, true);
+    auto findSphere = g_engfuncs.pfnFindEntityInSphere;
+    g_engfuncs.pfnFindEntityInSphere = Mock_StuckSphereSearch;
+    g_sphereSearchCalls = 0;
+    g_chaos.CmdTriggerById(37);
+    assert(g_sphereSearchCalls == 2);
+    g_engfuncs.pfnFindEntityInSphere = findSphere;
+}
+
+static int WaitForAutomaticEvent(DLL_FUNCTIONS &dll) {
+    const int before = g_deathCounter.GetTotalEvents();
+    for (int i = 0; i < 20 && g_deathCounter.GetTotalEvents() == before; ++i) Step(dll, 0.2f);
+    assert(g_deathCounter.GetTotalEvents() == before + 1 && "automatic chaos timer stalled");
+    return g_chaos.GetLastEventId();
+}
+
+static bool IsWeaponDropEvent(int id) {
+    return id == 22 || id == 23 || id == 42 || ChaosGetWeaponGift(id);
+}
+
+static bool HasReceivedWeapon() {
+    for (const std::string &item : g_receivedItems)
+        if (item.compare(0, 7, "weapon_") == 0) return true;
+    return false;
+}
+
+static void TestNpcWeaponPriority(DLL_FUNCTIONS &dll) {
+    printf("[3b] NPC spawn safety, fourteen real weapon deliveries and weighted automatic events...\n");
+    Mock_CVarSetFloat("chaos_enabled", 0);
+    Mock_CVarSetFloat("chaos_monsters", 1);
+    Mock_CVarSetFloat("chaos_spawn_limit", 8);
+    StartWorld(dll, "c1a2", 1, true);
+
+    // Exercise every standalone NPC event and check the actual spawned
+    // entities, not just the event banner. Hull traces must enclose the
+    // stock monster's bottom-at-origin box and avoid damaging floor contents.
+    for (int id = 0; id < 12; ++id) {
+        RemoveSpawned();
+        g_seenHullTypes = 0;
+        const int before = g_deathCounter.GetTotalEvents();
+        g_chaos.CmdTriggerById(id);
+        assert(g_deathCounter.GetTotalEvents() == before + 1);
+        assert(CountSpawned() >= 1 && CountSpawned() <= 3);
+        if (id == 3 || id == 7) assert(g_seenHullTypes & (1 << large_hull));
+        for (int i = 2; i < g_numEdicts; ++i) if (!g_edicts[i].free && g_edicts[i].v.iuser4 == 0xC4A05) {
+            assert((g_edicts[i].v.spawnflags & SF_MONSTER_FADECORPSE) != 0);
+            assert(fabsf(g_edicts[i].v.origin.z - 2.0f) < 0.01f);
+        }
+        Step(dll, 0.4f);
+    }
+    RemoveSpawned();
+    g_consoleOutput.clear();
+    g_blockHull = true; g_chaos.CmdTriggerById(0); assert(CountSpawned() == 0);
+    assert(Contains(g_consoleOutput, "НПС не создан"));
+    Step(dll, 0.4f); g_blockHull = false;
+    g_dangerAtFeet = true; g_chaos.CmdTriggerById(0); assert(CountSpawned() == 0);
+    Step(dll, 0.4f); g_dangerAtFeet = false;
+    int rejected = g_deathCounter.GetTotalEvents();
+    Mock_CVarSetFloat("chaos_monsters", NAN);
+    g_chaos.CmdTriggerById(8);
+    assert(g_deathCounter.GetTotalEvents() == rejected && CountSpawned() == 0);
+    Mock_CVarSetFloat("chaos_monsters", 1);
+    auto removeEntity = g_engfuncs.pfnRemoveEntity;
+    g_engfuncs.pfnRemoveEntity = nullptr;
+    g_chaos.CmdTriggerById(8); g_chaos.CmdTriggerById(480);
+    assert(g_deathCounter.GetTotalEvents() == rejected && CountSpawned() == 0);
+    g_engfuncs.pfnRemoveEntity = removeEntity;
+    for (int i = 0; i < 3; ++i) { g_chaos.CmdTriggerById(8); Step(dll, 0.4f); }
+    assert(CountSpawned() == 8);
+    int before = g_deathCounter.GetTotalEvents();
+    g_chaos.CmdTriggerById(8);
+    assert(g_deathCounter.GetTotalEvents() == before && CountSpawned() == 8);
+    // The original game removes a faded corpse; the freed slot permits more.
+    for (int i = 2; i < g_numEdicts; ++i) if (!g_edicts[i].free && g_edicts[i].v.iuser4 == 0xC4A05) {
+        Mock_RemoveEntity(&g_edicts[i]); break;
+    }
+    Step(dll, 0.4f); g_chaos.CmdTriggerById(8);
+    assert(CountSpawned() == 8);
+
+    StartWorld(dll, "c1a2", 1, true);
+    for (int id = CHAOS_WEAPON_GIFT_START; id < CHAOS_EVENT_COUNT; ++id) {
+        const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(id);
+        assert(gift && gift->event.id == id);
+        g_receivedItems.clear();
+        before = g_deathCounter.GetTotalEvents();
+        g_chaos.CmdTriggerById(id); Step(dll, 1.6f);
+        assert(g_deathCounter.GetTotalEvents() == before + 1);
+        assert(std::find(g_receivedItems.begin(), g_receivedItems.end(), gift->weapon) != g_receivedItems.end());
+        if (gift->ammo) assert(std::find(g_receivedItems.begin(), g_receivedItems.end(), gift->ammo) != g_receivedItems.end());
+    }
+
+    // Count the actual timer-driven selection, with spawned entities removed
+    // between samples so the normal eight-NPC limit does not bias the test.
+    Mock_CVarSetFloat("chaos_interval", 2);
+    Mock_CVarSetFloat("chaos_enabled", 1);
+    StartWorld(dll, "c1a2", 1, true);
+    int npc = 0, weapons = 0, other = 0, recipes = 0;
+    for (int n = 0; n < 600; ++n) {
+        RemoveSpawned();
+        g_edicts[1].v.health = 100;
+        g_receivedItems.clear();
+        int id = WaitForAutomaticEvent(dll);
+        if (id < 12) {
+            ++npc;
+            assert(CountSpawned() >= 1 && CountSpawned() <= 3);
+        } else if (IsWeaponDropEvent(id)) {
+            ++weapons;
+        } else if (ChaosRecipeTheme(id) >= 0) {
+            ++recipes;
+            assert(!(ChaosRecipeTheme(id) == 15 && (ChaosRecipeVariant(id) == 8 || ChaosRecipeVariant(id) == 9)));
+        } else {
+            ++other;
+        }
+        Step(dll, 0.4f); // queued weapons are actually delivered, at most two per tick
+        if (IsWeaponDropEvent(id)) assert(HasReceivedWeapon());
+        g_allMessages.clear(); g_consoleOutput.clear();
+    }
+    printf("    600 automatic events: NPC=%d weapons=%d other=%d combinations=%d\n", npc, weapons, other, recipes);
+    assert(npc >= 250 && npc <= 400);
+    assert(weapons >= 140 && weapons <= 260);
+    assert(npc + weapons >= 450 && recipes <= 75);
+    assert(other > 0 && recipes > 0); // themed combinations still occasionally occur
+
+    // A map with only the world-precached snark must keep choosing it even
+    // when that ID is in recent history; its category cannot starve.
+    StartWorld(dll, "c1a2", 1, true, false);
+    int snarks = 0;
+    for (int n = 0; n < 160; ++n) {
+        RemoveSpawned(); g_edicts[1].v.health = 100;
+        int id = WaitForAutomaticEvent(dll);
+        if (id < 12) { assert(id == 8 && CountSpawned() == 3); ++snarks; }
+        Step(dll, 0.4f); g_allMessages.clear(); g_consoleOutput.clear();
+    }
+    assert(snarks >= 50);
+
+    // Explicitly disabling NPCs leaves other categories running normally.
+    Mock_CVarSetFloat("chaos_monsters", 0);
+    StartWorld(dll, "c1a2", 1, true);
+    weapons = 0;
+    for (int n = 0; n < 50; ++n) {
+        g_edicts[1].v.health = 100;
+        int id = WaitForAutomaticEvent(dll);
+        assert(id >= 12 && CountSpawned() == 0);
+        if (IsWeaponDropEvent(id)) ++weapons;
+        Step(dll, 0.4f); g_allMessages.clear(); g_consoleOutput.clear();
+    }
+    assert(weapons > 0);
+
+    // Missing classes are never spawned or advertised as weapon gifts; chaos
+    // falls back instead of stalling. Restore mock resource setup afterwards.
+    Mock_CVarSetFloat("chaos_monsters", 1);
+    g_precacheStockWeapons = false; g_precacheStockSnark = false;
+    StartWorld(dll, "c1a2", 1, true, false);
+    before = g_deathCounter.GetTotalEvents();
+    g_chaos.CmdTriggerById(CHAOS_WEAPON_GIFT_START);
+    assert(g_deathCounter.GetTotalEvents() == before);
+    for (int n = 0; n < 40; ++n) {
+        g_edicts[1].v.health = 100;
+        int id = WaitForAutomaticEvent(dll);
+        assert(id >= 12 && !IsWeaponDropEvent(id) && CountSpawned() == 0);
+        Step(dll, 0.4f); g_allMessages.clear(); g_consoleOutput.clear();
+    }
+    g_precacheStockWeapons = true; g_precacheStockSnark = true;
+
+    // Random weapon gift must choose from available classes, not silently
+    // pick an unavailable weapon on a reduced/OEM precache table.
+    Mock_CVarSetFloat("chaos_enabled", 0);
+    g_stockWeaponFilter = "weapon_9mmhandgun";
+    StartWorld(dll, "c1a2", 1, true, false);
+    g_receivedItems.clear();
+    g_chaos.CmdTriggerById(22); Step(dll, 1.6f);
+    assert(HasReceivedWeapon());
+    for (const std::string &item : g_receivedItems)
+        if (item.compare(0, 7, "weapon_") == 0) assert(item == "weapon_9mmhandgun");
+    g_stockWeaponFilter = nullptr;
+    Mock_CVarSetFloat("chaos_enabled", 1);
+
+    // Before HEV, NPC and inventory spawns wait; other timed events continue.
+    StartWorld(dll, "c1a0", 1, false);
+    before = g_deathCounter.GetTotalEvents();
+    g_chaos.CmdTriggerById(0);
+    assert(g_deathCounter.GetTotalEvents() == before && CountSpawned() == 0);
+    for (int n = 0; n < 30; ++n) {
+        g_edicts[1].v.health = 100;
+        int id = WaitForAutomaticEvent(dll);
+        assert(id >= 12 && !IsWeaponDropEvent(id) && CountSpawned() == 0);
+        Step(dll, 0.4f); g_allMessages.clear(); g_consoleOutput.clear();
+    }
+    Mock_CVarSetFloat("chaos_interval", 10);
+    Mock_CVarSetFloat("chaos_enabled", 0);
+}
+
 int main() {
     srand(19981119); // Half-Life 1 release date seed!
 
@@ -715,23 +1003,33 @@ int main() {
 
     dllTable.pfnGameInit();
     assert(g_serverCommands.size() == 1 && g_serverCommands[0] == "exec chaos.cfg\n");
+    assert(Mock_CVarGetFloat("chaos_monsters") == 1 && "NPC events should be enabled by default");
     StartWorld(dllTable, "c1a2", 1.0f, true, true, false);
     assert(g_serverCommands.size() == 1); // no repeated exec on ServerActivate
 
-    printf("[1] 477 event definitions and unique recipe IDs...\n");
-    assert(g_chaos.GetEventCount() == 477);
+    printf("[1] 491 event definitions, 14 standalone weapon gifts and unique recipes...\n");
+    assert(g_chaos.GetEventCount() == 491);
     std::set<std::string> recipeTitles;
     for (int i = 0; i < g_chaos.GetEventCount(); ++i) {
         const ChaosEventDef *ev = g_chaos.GetEventDef(i);
         assert(ev && ev->id == i && ev->titleEn && *ev->titleEn && ev->titleRu && *ev->titleRu && ev->descRu && *ev->descRu);
-        if ((i >= CHAOS_RECIPE_START && i < CHAOS_RECIPE_END) || i >= CHAOS_EXTENSION_START)
+        if ((i >= CHAOS_RECIPE_START && i < CHAOS_RECIPE_END) ||
+            (i >= CHAOS_EXTENSION_START && i < CHAOS_EXTENSION_END))
             assert(recipeTitles.insert(ev->titleEn).second);
     }
     assert(recipeTitles.size() == 432);
     assert(ChaosRecipeTheme(428) == -1 && ChaosRecipeVariant(428) == -1);
     assert(ChaosRecipeTheme(429) == 0 && ChaosRecipeVariant(429) == 16);
     assert(ChaosRecipeTheme(476) == 23 && ChaosRecipeVariant(476) == 17);
-    assert(!g_chaos.GetEventDef(-1) && !g_chaos.GetEventDef(477));
+    assert(ChaosRecipeTheme(477) == -1 && ChaosRecipeVariant(477) == -1);
+    const int awpRecipe = CHAOS_RECIPE_START + 15 * CHAOS_VARIANT_COUNT;
+    assert(!ChaosRecipeAllowedAutomatically(awpRecipe + 8, false));
+    assert(!ChaosRecipeAllowedAutomatically(awpRecipe + 9, false));
+    assert(ChaosRecipeAllowedAutomatically(awpRecipe + 10, false));
+    assert(!ChaosRecipeAllowedAutomatically(awpRecipe + 10, true));
+    assert(!ChaosRecipeAllowedAutomatically(477, false));
+    assert(ChaosGetWeaponGift(477) && ChaosGetWeaponGift(490) && !ChaosGetWeaponGift(476));
+    assert(!g_chaos.GetEventDef(-1) && !g_chaos.GetEventDef(491));
 
     printf("[2] Automatic timer, bounded HUD and strict command parsing...\n");
     int before = g_deathCounter.GetTotalEvents();
@@ -888,7 +1186,10 @@ int main() {
     assert(g_emittedSounds == soundBefore);
     g_precacheCues = true;
 
-    printf("[4] Exercise all 477 events and expire every modifier...\n");
+    TestBombSearchAndBlast(dllTable);
+    TestNpcWeaponPriority(dllTable);
+
+    printf("[4] Exercise all 491 events and expire every modifier...\n");
     StartWorld(dllTable, "c1a2", 10, true);
     Mock_CVarSetFloat("chaos_enabled", 0);
     g_receivedItems.clear();

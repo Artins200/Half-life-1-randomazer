@@ -190,7 +190,7 @@ ChaosManager::ChaosManager()
     m_cvarInterval = { "chaos_interval", "10", FCVAR_SERVER | FCVAR_ARCHIVE, 10.0f, nullptr };
     m_cvarSound    = { "chaos_sound",    "1",  FCVAR_SERVER | FCVAR_ARCHIVE, 1.0f,  nullptr };
     m_cvarRuChat   = { "chaos_ru_chat",  "1",  FCVAR_SERVER | FCVAR_ARCHIVE, 1.0f,  nullptr };
-    m_cvarMonsters = { "chaos_monsters", "0", FCVAR_SERVER | FCVAR_ARCHIVE, 0.0f, nullptr };
+    m_cvarMonsters = { "chaos_monsters", "1", FCVAR_SERVER | FCVAR_ARCHIVE, 1.0f, nullptr };
     m_cvarSpawnLimit = { "chaos_spawn_limit", "8", FCVAR_SERVER | FCVAR_ARCHIVE, 8.0f, nullptr };
     m_cvarIntroTroll = { "chaos_intro_troll", "1", FCVAR_SERVER | FCVAR_ARCHIVE, 1.0f, nullptr };
     memset(m_classReady, 0, sizeof(m_classReady));
@@ -463,6 +463,19 @@ bool ChaosManager::IsEventAllowed(const edict_t *player, int eventId) const {
     return IsChaosSessionAvailable(player) && IsEventAllowedInSession(player, eventId);
 }
 
+bool ChaosManager::HasReadyWeaponForEvent(int eventId) const {
+    if (const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(eventId)) return IsClassReady(gift->weapon);
+    if (eventId == 42) {
+        return IsClassReady("weapon_9mmAR") || IsClassReady("weapon_shotgun") || IsClassReady("weapon_gauss");
+    }
+    if (eventId != 22 && eventId != 23) return false;
+    for (int i = 0; i < CHAOS_WEAPON_GIFT_COUNT; ++i) {
+        const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(CHAOS_WEAPON_GIFT_START + i);
+        if (gift && IsClassReady(gift->weapon)) return true;
+    }
+    return false;
+}
+
 bool ChaosManager::IsEventAllowedInSession(const edict_t *player, int eventId) const {
     const ChaosEventDef *ev = ChaosGetEventDef(eventId);
     if (!ev) return false;
@@ -474,10 +487,19 @@ bool ChaosManager::IsEventAllowedInSession(const edict_t *player, int eventId) c
             "monster_zombie", "monster_alien_slave", "monster_human_grunt", "monster_alien_grunt",
             "monster_snark", "monster_cockroach", "monster_barney", "monster_scientist"
         };
-        if (!g_engfuncs.pfnCVarGetFloat || g_engfuncs.pfnCVarGetFloat("chaos_monsters") <= 0.0f ||
-            !IsClassReady(classes[eventId]) || !HasEntityHeadroom()) return false;
+        if (!g_engfuncs.pfnCVarGetFloat || !g_engfuncs.pfnAllocString || !g_engfuncs.pfnCreateNamedEntity ||
+            !g_engfuncs.pfnRemoveEntity || !g_engfuncs.pfnTraceLine || !g_engfuncs.pfnTraceHull ||
+            !g_engfuncs.pfnPointContents || !g_origDllFuncs.pfnSpawn || !IsClassReady(classes[eventId]) ||
+            !HasEntityHeadroom()) return false;
+        float monstersEnabled = g_engfuncs.pfnCVarGetFloat("chaos_monsters");
+        if (!isfinite(monstersEnabled) || monstersEnabled <= 0.0f) return false;
         float limit = g_engfuncs.pfnCVarGetFloat("chaos_spawn_limit");
         if (!isfinite(limit) || limit <= 0 || CountChaosEntities() >= (int)(limit < 16 ? limit : 16)) return false;
+    }
+    if (eventId == 22 || eventId == 23 || eventId == 42 || ChaosGetWeaponGift(eventId)) {
+        if (!HasReadyWeaponForEvent(eventId) || !HasEntityHeadroom() || !g_engfuncs.pfnAllocString ||
+            !g_engfuncs.pfnCreateNamedEntity || !g_engfuncs.pfnRemoveEntity ||
+            !g_origDllFuncs.pfnSpawn || !g_origDllFuncs.pfnTouch) return false;
     }
     return true;
 }
@@ -672,41 +694,75 @@ uint32_t static NextXorShift(uint32_t &state) {
     return x;
 }
 
+enum AutomaticEventPool { AUTO_NPC, AUTO_WEAPON, AUTO_OTHER, AUTO_RECIPE, AUTO_POOL_COUNT };
+
+static AutomaticEventPool AutomaticPoolFor(int id) {
+    if (id >= 0 && id < 12) return AUTO_NPC;
+    if (id == 22 || id == 23 || id == 42 || ChaosGetWeaponGift(id)) return AUTO_WEAPON;
+    if ((id >= CHAOS_RECIPE_START && id < CHAOS_RECIPE_END) ||
+        (id >= CHAOS_EXTENSION_START && id < CHAOS_EXTENSION_END)) return AUTO_RECIPE;
+    return AUTO_OTHER;
+}
+
 int ChaosManager::PickNextEventId(const edict_t *pPlayer) {
     if (!IsChaosSessionAvailable(pPlayer)) return -1;
-    int candidates[CHAOS_EVENT_COUNT];
+    struct Candidate { int id; AutomaticEventPool pool; bool recent; };
+    Candidate candidates[CHAOS_EVENT_COUNT];
     int candidateCount = 0;
-
-    // The session/client count is stable for this synchronous selection; do
-    // not rescan every player slot once per catalog entry.
-    for (int pass = 0; pass < 2 && candidateCount == 0; ++pass) {
-        for (int i = 0; i < CHAOS_EVENT_COUNT; ++i) {
-            if (!IsEventAllowedInSession(pPlayer, i)) continue;
-
-            if (pass == 0) {
-                bool recentlyUsed = false;
-                for (int h = 0; h < CHAOS_HISTORY_SIZE; ++h) {
-                    if (m_recentEvents[h] == i) {
-                        recentlyUsed = true;
-                        break;
-                    }
-                }
-                if (recentlyUsed) continue;
-            }
-            candidates[candidateCount++] = i;
+    int counts[AUTO_POOL_COUNT] = {};
+    int freshCounts[AUTO_POOL_COUNT] = {};
+    // Select a category first, then an ID. 432 recipes must not outweigh all
+    // standalone NPCs simply because there are more combinations in the list.
+    const int weights[AUTO_POOL_COUNT] = {50, 35, 10, 5};
+    const bool restricted = IsRestrictedState(pPlayer);
+    for (int i = 0; i < CHAOS_EVENT_COUNT; ++i) {
+        if (!IsEventAllowedInSession(pPlayer, i)) continue;
+        AutomaticEventPool pool = AutomaticPoolFor(i);
+        if (pool == AUTO_WEAPON && m_itemQueueCount > 0) continue;
+        if (pool == AUTO_RECIPE) {
+            // Intro/cutscenes get standalone visual events only. The two AWP
+            // combinations that immediately overwrite their own FOV are
+            // manual-only; the remaining recipes stay eligible at low weight.
+            if (!ChaosRecipeAllowedAutomatically(i, restricted)) continue;
         }
+        bool recent = false;
+        for (int h = 0; h < CHAOS_HISTORY_SIZE; ++h) {
+            if (m_recentEvents[h] == i) { recent = true; break; }
+        }
+        candidates[candidateCount++] = {i, pool, recent};
+        ++counts[pool];
+        if (!recent) ++freshCounts[pool];
     }
 
-    if (candidateCount <= 0) {
-        return -1; // No safe event on this map/player state.
-    }
+    int totalWeight = 0;
+    for (int p = 0; p < AUTO_POOL_COUNT; ++p) if (counts[p]) totalWeight += weights[p];
+    if (!totalWeight) return -1;
 
     uint32_t r = NextXorShift(m_rngState);
-    if (g_engfuncs.pfnRandomLong) {
-        r ^= (uint32_t)g_engfuncs.pfnRandomLong(0, 100000);
+    if (g_engfuncs.pfnRandomLong) r ^= (uint32_t)g_engfuncs.pfnRandomLong(0, 100000);
+    int ticket = (int)(r % (uint32_t)totalWeight);
+    int selectedPool = 0;
+    for (; selectedPool < AUTO_POOL_COUNT; ++selectedPool) {
+        if (!counts[selectedPool]) continue;
+        if (ticket < weights[selectedPool]) break;
+        ticket -= weights[selectedPool];
     }
-    int chosen = candidates[r % (uint32_t)candidateCount];
+    if (selectedPool == AUTO_POOL_COUNT) return -1;
 
+    // History is relaxed independently for each category. If, for example,
+    // snarks are the only prepared NPC, they must not disappear for eight
+    // events merely because other categories have fresh IDs available.
+    const bool requireFresh = freshCounts[selectedPool] > 0;
+    const int poolCount = requireFresh ? freshCounts[selectedPool] : counts[selectedPool];
+    r = NextXorShift(m_rngState);
+    if (g_engfuncs.pfnRandomLong) r ^= (uint32_t)g_engfuncs.pfnRandomLong(0, 100000);
+    int chosenIndex = (int)(r % (uint32_t)poolCount);
+    int chosen = -1;
+    for (int i = 0; i < candidateCount; ++i) {
+        if ((int)candidates[i].pool != selectedPool || (requireFresh && candidates[i].recent)) continue;
+        if (chosenIndex-- == 0) { chosen = candidates[i].id; break; }
+    }
+    if (chosen < 0) return -1;
     m_recentEvents[m_recentHead] = chosen;
     m_recentHead = (m_recentHead + 1) % CHAOS_HISTORY_SIZE;
     return chosen;
@@ -762,13 +818,19 @@ bool ChaosManager::FindSafeSpawnSpot(const edict_t *pPlayer, int hullType, float
         g_engfuncs.pfnTraceHull(candidate, downTarget, 0 /*dont_ignore_monsters*/, hullType, (edict_t *)pPlayer, &floorTr);
 
         if (floorTr.fAllSolid || floorTr.fStartSolid || floorTr.flFraction >= 1.0f) continue;
-        Vec3 finalSpot(floorTr.vecEndPos.x, floorTr.vecEndPos.y, floorTr.vecEndPos.z + 2.0f);
+        Vec3 hullCenter = floorTr.vecEndPos + Vec3(0, 0, 2.0f);
 
         TraceResult hullCheck;
         memset((void *)&hullCheck, 0, sizeof(hullCheck));
-        g_engfuncs.pfnTraceHull(finalSpot, finalSpot, 0 /*dont_ignore_monsters*/, hullType, (edict_t *)pPlayer, &hullCheck);
-        if (!hullCheck.fAllSolid && !hullCheck.fStartSolid) {
-            outPos = finalSpot;
+        g_engfuncs.pfnTraceHull(hullCenter, hullCenter, 0 /*dont_ignore_monsters*/, hullType, (edict_t *)pPlayer, &hullCheck);
+        // GoldSrc TraceHull is centered vertically, while the stock monster
+        // classes use a bottom-at-origin bounding box. Align the validated
+        // hull to the actual NPC, rather than placing its feet at the center.
+        const float halfHeight = hullType == large_hull ? 32.0f : (hullType == head_hull ? 18.0f : 36.0f);
+        Vec3 monsterOrigin = hullCenter - Vec3(0, 0, halfHeight);
+        if (!hullCheck.fAllSolid && !hullCheck.fStartSolid &&
+            g_engfuncs.pfnPointContents(monsterOrigin + Vec3(0, 0, 1)) == CONTENTS_EMPTY) {
+            outPos = monsterOrigin;
             return true;
         }
     }
@@ -778,8 +840,10 @@ bool ChaosManager::FindSafeSpawnSpot(const edict_t *pPlayer, int hullType, float
 
 int ChaosManager::SpawnMonstersAroundPlayer(edict_t *pPlayer, const char *classname, int count, int hullType, bool friendly) {
     if (!pPlayer || !classname || !IsClassReady(classname) || !g_engfuncs.pfnAllocString ||
-        !g_engfuncs.pfnCreateNamedEntity || !g_origDllFuncs.pfnSpawn || !g_engfuncs.pfnCVarGetFloat ||
-        g_engfuncs.pfnCVarGetFloat("chaos_monsters") <= 0.0f) return 0;
+        !g_engfuncs.pfnCreateNamedEntity || !g_engfuncs.pfnRemoveEntity || !g_origDllFuncs.pfnSpawn ||
+        !g_engfuncs.pfnCVarGetFloat) return 0;
+    float monstersEnabled = g_engfuncs.pfnCVarGetFloat("chaos_monsters");
+    if (!isfinite(monstersEnabled) || monstersEnabled <= 0.0f) return 0;
     float configured = g_engfuncs.pfnCVarGetFloat("chaos_spawn_limit");
     if (!isfinite(configured) || configured <= 0) return 0;
     int limit = (int)(configured < 16 ? configured : 16);
@@ -809,6 +873,9 @@ int ChaosManager::SpawnMonstersAroundPlayer(edict_t *pPlayer, const char *classn
         pent->v.origin = spawnPos;
         pent->v.angles = Vec3(0.0f, yaw, 0.0f);
         pent->v.iuser4 = 0xC4A05; // Mark as Chaos-spawned entity
+        // Let the original NPC AI fade its own corpse; otherwise a few dead
+        // chaos NPCs could permanently exhaust the per-map spawn limit.
+        pent->v.spawnflags |= SF_MONSTER_FADECORPSE;
 
         int spawnResult = g_origDllFuncs.pfnSpawn(pent);
         if (spawnResult < 0 && !pent->free && g_engfuncs.pfnRemoveEntity) g_engfuncs.pfnRemoveEntity(pent);
@@ -833,7 +900,7 @@ int ChaosManager::SpawnMonstersAroundPlayer(edict_t *pPlayer, const char *classn
 
 void ChaosManager::GiveItemToPlayer(edict_t *pPlayer, const char *itemClassname) {
     if (!pPlayer || !itemClassname || !IsClassReady(itemClassname) || !HasEntityHeadroom() ||
-        !g_engfuncs.pfnAllocString || !g_engfuncs.pfnCreateNamedEntity ||
+        !g_engfuncs.pfnAllocString || !g_engfuncs.pfnCreateNamedEntity || !g_engfuncs.pfnRemoveEntity ||
         !g_origDllFuncs.pfnSpawn || !g_origDllFuncs.pfnTouch) {
         return;
     }
@@ -880,7 +947,12 @@ void ChaosManager::QueueItemToPlayer(edict_t *player, const char *classname) {
 }
 void ChaosManager::UpdateItemQueue(edict_t *player) {
     if (!gpGlobals || !player || !m_itemQueueCount || gpGlobals->time < m_nextItemTick) return;
-    if (!IsEventAllowed(player, 23)) { ClearItemQueue(); return; }
+    // A queue may contain supplies as well as weapons; do not depend on the
+    // availability of the full-arsenal event to finish processing it.
+    if (!IsChaosSessionAvailable(player) || IsRestrictedState(player) || !PlayerHasSuit(player)) {
+        ClearItemQueue();
+        return;
+    }
     m_nextItemTick = gpGlobals->time + 0.25f;
     for (int i = 0; i < 2 && m_itemQueueCount > 0; ++i) {
         char item[32];
@@ -916,15 +988,22 @@ void ChaosManager::StripPlayerWeapons(edict_t *pPlayer) {
     }
 }
 
-int ChaosManager::LaunchNearbyEnemies(edict_t *pPlayer, float radius, float upwardVel) {
-    if (!pPlayer || !g_engfuncs.pfnFindEntityInSphere) {
-        return 0;
-    }
+int ChaosManager::LaunchNearbyEnemies(edict_t *pPlayer, const Vec3 &center, float radius, float upwardVel) {
+    if (!pPlayer || !gpGlobals || gpGlobals->maxEntities <= 0 || !g_engfuncs.pfnFindEntityInSphere ||
+        (!g_engfuncs.pfnEntOffsetOfPEntity && !g_engfuncs.pfnIndexOfEdict)) return 0;
 
     int count = 0;
     edict_t *ent = nullptr;
-    while ((ent = g_engfuncs.pfnFindEntityInSphere(ent, pPlayer->v.origin, radius)) != nullptr) {
-        if (ent == pPlayer || ent->free) continue;
+    int maxScans = gpGlobals->maxEntities;
+    if (maxScans > 4096) maxScans = 4096;
+    for (int scanned = 0; scanned < maxScans; ++scanned) {
+        edict_t *next = g_engfuncs.pfnFindEntityInSphere(ent, center, radius);
+        // GoldSrc signals end-of-search with edict 0 (worldspawn), not NULL.
+        // Searching again from that sentinel restarts at the beginning forever.
+        if (FNullEnt(next) || (g_engfuncs.pfnIndexOfEdict && g_engfuncs.pfnIndexOfEdict(next) == 0) ||
+            next == ent) break;
+        ent = next;
+        if (ent == pPlayer) continue;
         if (!(ent->v.flags & FL_MONSTER) || ent->v.movetype != MOVETYPE_STEP) continue;
         if (ent->v.deadflag != DEAD_NO || ent->v.health <= 0.0f) continue;
 
@@ -1165,11 +1244,11 @@ void ChaosManager::RefreshStatusHud(edict_t *pPlayer) {
     char hudBuf[384];
     if (enabled && !IsChaosSessionAvailable(pPlayer)) {
         snprintf(hudBuf, sizeof(hudBuf),
-                 "=== HL1 CHAOS v1.1 ===\nDEATHS: %d  (MAP: %d)\nWAITING FOR SINGLE PLAYER%s",
+                 "=== HL1 CHAOS v1.2 ===\nDEATHS: %d  (MAP: %d)\nWAITING FOR SINGLE PLAYER%s",
                  g_deathCounter.GetTotalDeaths(), g_deathCounter.GetMapDeaths(), runLine);
     } else if (enabled) {
         snprintf(hudBuf, sizeof(hudBuf),
-                 "=== HL1 CHAOS v1.1 ===\n"
+                 "=== HL1 CHAOS v1.2 ===\n"
                  "DEATHS: %d  (MAP: %d)\n"
                  "NEXT: %2ds [%s]\n"
                  "LAST: %s%s%s%s%s",
@@ -1184,7 +1263,7 @@ void ChaosManager::RefreshStatusHud(edict_t *pPlayer) {
                  runLine);
     } else {
         snprintf(hudBuf, sizeof(hudBuf),
-                 "=== HL1 CHAOS v1.1 [PAUSED] ===\n"
+                 "=== HL1 CHAOS v1.2 [PAUSED] ===\n"
                  "DEATHS: %d  (MAP: %d)\n"
                  "Type chaos_toggle to resume%s",
                  g_deathCounter.GetTotalDeaths(),
@@ -1292,81 +1371,86 @@ void ChaosManager::ExecuteEvent(edict_t *pPlayer, int eventId) {
              eventNum, ev.titleRu, ev.descRu, g_deathCounter.GetTotalDeaths());
     SendChatAndConsole(pPlayer, chatBuf);
 
-    if ((eventId >= CHAOS_RECIPE_START && eventId < CHAOS_RECIPE_END) || eventId >= CHAOS_EXTENSION_START) {
+    if (const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(eventId)) {
+        QueueItemToPlayer(pPlayer, gift->weapon);
+        if (gift->ammo) QueueItemToPlayer(pPlayer, gift->ammo);
+        if (gift->bonusAmmo) QueueItemToPlayer(pPlayer, gift->bonusAmmo);
+        PlayCueSound(pPlayer, "items/gunpickup2.wav", PITCH_NORM);
+        RefreshStatusHud(pPlayer);
+        return;
+    }
+    if ((eventId >= CHAOS_RECIPE_START && eventId < CHAOS_RECIPE_END) ||
+        (eventId >= CHAOS_EXTENSION_START && eventId < CHAOS_EXTENSION_END)) {
         RunTheme(pPlayer, ChaosRecipeTheme(eventId));
         RunVariant(pPlayer, ChaosRecipeVariant(eventId));
         RefreshStatusHud(pPlayer);
         return;
     }
+    int spawnedNpcs = -1;
     switch (eventId) {
         case 0: // HEADCRAB AMBUSH
-            SpawnMonstersAroundPlayer(pPlayer, "monster_headcrab", 3, head_hull, false);
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_headcrab", 3, head_hull, false);
             PlayCueSound(pPlayer, "debris/beamstart7.wav", PITCH_NORM);
             break;
 
         case 1: // BABY CRAB SWARM
-            SpawnMonstersAroundPlayer(pPlayer, "monster_babycrab", 5, head_hull, false);
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_babycrab", 5, head_hull, false);
             PlayCueSound(pPlayer, "debris/beamstart7.wav", PITCH_HIGH);
             break;
 
         case 2: // HOUNDEYE PACK
-            SpawnMonstersAroundPlayer(pPlayer, "monster_houndeye", 2, human_hull, false);
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_houndeye", 2, human_hull, false);
             PlayCueSound(pPlayer, "debris/beamstart7.wav", PITCH_NORM);
             break;
 
         case 3: // BULLSQUID SURPRISE
-            if (SpawnMonstersAroundPlayer(pPlayer, "monster_bullchicken", 1, human_hull, false) == 0) {
-                SpawnMonstersAroundPlayer(pPlayer, "monster_headcrab", 2, head_hull, false);
-            }
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_bullchicken", 1, large_hull, false);
+            if (!spawnedNpcs) spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_headcrab", 2, head_hull, false);
             PlayCueSound(pPlayer, "debris/beamstart7.wav", PITCH_LOW);
             break;
 
         case 4: // ZOMBIE OUTBREAK
-            if (SpawnMonstersAroundPlayer(pPlayer, "monster_zombie", 2, human_hull, false) == 0) {
-                SpawnMonstersAroundPlayer(pPlayer, "monster_headcrab", 3, head_hull, false);
-            }
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_zombie", 2, human_hull, false);
+            if (!spawnedNpcs) spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_headcrab", 3, head_hull, false);
             PlayCueSound(pPlayer, "debris/beamstart7.wav", PITCH_LOW);
             break;
 
         case 5: // VORTIGAUNT RAID
             SendScreenFade(pPlayer, 40, 255, 60, 75, 0.35f, 0.1f, FFADE_IN);
-            if (SpawnMonstersAroundPlayer(pPlayer, "monster_alien_slave", 1, human_hull, false) == 0) {
-                SpawnMonstersAroundPlayer(pPlayer, "monster_houndeye", 1, human_hull, false);
-            }
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_alien_slave", 1, human_hull, false);
+            if (!spawnedNpcs) spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_houndeye", 1, human_hull, false);
             PlayCueSound(pPlayer, "debris/beamstart7.wav", PITCH_NORM);
             break;
 
         case 6: // HECU MARINE DROP
-            if (SpawnMonstersAroundPlayer(pPlayer, "monster_human_grunt", 1, human_hull, false) == 0) {
-                SpawnMonstersAroundPlayer(pPlayer, "monster_snark", 3, head_hull, false);
-            }
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_human_grunt", 1, human_hull, false);
+            if (!spawnedNpcs) spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_snark", 3, head_hull, false);
             PlayCueSound(pPlayer, "buttons/button10.wav", PITCH_NORM);
             break;
 
         case 7: // ALIEN GRUNT HORNETS
-            if (SpawnMonstersAroundPlayer(pPlayer, "monster_alien_grunt", 1, human_hull, false) == 0) {
-                SpawnMonstersAroundPlayer(pPlayer, "monster_alien_slave", 1, human_hull, false);
-            }
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_alien_grunt", 1, large_hull, false);
+            if (!spawnedNpcs) spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_alien_slave", 1, human_hull, false);
             PlayCueSound(pPlayer, "debris/beamstart7.wav", PITCH_LOW);
             break;
 
         case 8: // SNARK PARTY
-            SpawnMonstersAroundPlayer(pPlayer, "monster_snark", 4, head_hull, false);
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_snark", 4, head_hull, false);
             PlayCueSound(pPlayer, "debris/zap4.wav", PITCH_HIGH);
             break;
 
         case 9: // ROACH INFESTATION
-            SpawnMonstersAroundPlayer(pPlayer, "monster_cockroach", 10, head_hull, true);
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_cockroach", 10, head_hull, true);
             PlayCueSound(pPlayer, "buttons/button3.wav", PITCH_HIGH);
             break;
 
         case 10: // BARNEY BACKUP
-            SpawnMonstersAroundPlayer(pPlayer, "monster_barney", 1, human_hull, true);
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_barney", 1, human_hull, true);
             PlayCueSound(pPlayer, "items/suitchargeok1.wav", PITCH_NORM);
             break;
 
         case 11: // PANICKED SCIENTISTS
-            SpawnMonstersAroundPlayer(pPlayer, "monster_scientist", 3, human_hull, true);
+            spawnedNpcs = SpawnMonstersAroundPlayer(pPlayer, "monster_scientist", 3, human_hull, true);
             PlayCueSound(pPlayer, "buttons/button3.wav", PITCH_NORM);
             break;
 
@@ -1478,22 +1562,19 @@ void ChaosManager::ExecuteEvent(edict_t *pPlayer, int eventId) {
 
         case 22: // RANDOM WEAPON GIFT
         {
-            struct WeaponBundle { const char *wpn; const char *ammo1; const char *ammo2; };
-            static const WeaponBundle kBundles[] = {
-                { "weapon_357",       "ammo_357",       "ammo_357" },
-                { "weapon_shotgun",   "ammo_buckshot",  "ammo_buckshot" },
-                { "weapon_9mmAR",     "ammo_9mmAR",     "ammo_ARgrenades" },
-                { "weapon_crossbow",  "ammo_crossbow",  "ammo_crossbow" },
-                { "weapon_rpg",       "ammo_rpgclip",   "ammo_rpgclip" },
-                { "weapon_gauss",     "ammo_gaussclip", "ammo_gaussclip" },
-                { "weapon_egon",      "ammo_gaussclip", "ammo_gaussclip" },
-                { "weapon_hornetgun", nullptr,          nullptr }
-            };
-            const WeaponBundle &b = kBundles[NextXorShift(m_rngState) % (sizeof(kBundles) / sizeof(kBundles[0]))];
-            QueueItemToPlayer(pPlayer, b.wpn);
-            if (b.ammo1) QueueItemToPlayer(pPlayer, b.ammo1);
-            if (b.ammo2) QueueItemToPlayer(pPlayer, b.ammo2);
-            PlayCueSound(pPlayer, "items/gunpickup2.wav", PITCH_NORM);
+            const ChaosWeaponGiftDef *ready[CHAOS_WEAPON_GIFT_COUNT];
+            int count = 0;
+            for (int i = 0; i < CHAOS_WEAPON_GIFT_COUNT; ++i) {
+                const ChaosWeaponGiftDef *gift = ChaosGetWeaponGift(CHAOS_WEAPON_GIFT_START + i);
+                if (gift && IsClassReady(gift->weapon)) ready[count++] = gift;
+            }
+            if (count > 0) {
+                const ChaosWeaponGiftDef &gift = *ready[NextXorShift(m_rngState) % (uint32_t)count];
+                QueueItemToPlayer(pPlayer, gift.weapon);
+                if (gift.ammo) QueueItemToPlayer(pPlayer, gift.ammo);
+                if (gift.bonusAmmo) QueueItemToPlayer(pPlayer, gift.bonusAmmo);
+                PlayCueSound(pPlayer, "items/gunpickup2.wav", PITCH_NORM);
+            }
             break;
         }
 
@@ -1634,7 +1715,7 @@ void ChaosManager::ExecuteEvent(edict_t *pPlayer, int eventId) {
             m_flDiscoEnd = now + ev.durationSec;
             m_flNextDiscoTick = now + 0.05f;
             m_discoPhase = 0;
-            LaunchNearbyEnemies(pPlayer, 900.0f, 460.0f);
+            LaunchNearbyEnemies(pPlayer, pPlayer->v.origin, 900.0f, 460.0f);
             PlayCueSound(pPlayer, "debris/zap4.wav", PITCH_HIGH);
             break;
 
@@ -1651,6 +1732,9 @@ void ChaosManager::ExecuteEvent(edict_t *pPlayer, int eventId) {
         default: break;
     }
 
+    if (spawnedNpcs == 0) {
+        SendChatAndConsole(pPlayer, "[ХАОС] НПС не создан: нет безопасного места, слота или необходимых ресурсов.\n");
+    }
     RefreshStatusHud(pPlayer);
 }
 
@@ -1806,8 +1890,8 @@ void ChaosManager::UpdateTimedModifiers(edict_t *pPlayer) {
             SendScreenShake(pPlayer, 14.0f, 80.0f, 1.4f);
             PlayCueSound(pPlayer, "debris/beamstart7.wav", PITCH_LOW);
 
-            // Launch nearby enemies
-            LaunchNearbyEnemies(pPlayer, 450.0f, 480.0f);
+            // The blast stays at the armed position even if the player moved.
+            LaunchNearbyEnemies(pPlayer, m_vecAnomalyOrigin, 450.0f, 480.0f);
 
             // Push player away if still standing close (never lethal!)
             Vec3 delta = pPlayer->v.origin - m_vecAnomalyOrigin;
@@ -2183,7 +2267,7 @@ void ChaosManager::CmdPrintStatus(edict_t *pPlayer) {
     if (!pPlayer) pPlayer = FindActivePlayer();
     char buf[256];
     snprintf(buf, sizeof(buf),
-             "[ХАОС v1.1] Смертей всего: %d | На этой карте: %d | Пережито событий: %d | До след. события: %.1f сек\n",
+             "[ХАОС v1.2] Смертей всего: %d | На этой карте: %d | Пережито событий: %d | До след. события: %.1f сек\n",
              g_deathCounter.GetTotalDeaths(),
              g_deathCounter.GetMapDeaths(),
              g_deathCounter.GetTotalEvents(),

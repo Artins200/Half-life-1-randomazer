@@ -27,9 +27,19 @@ typedef int (*ProbeFn)();
 
 static int soundCalls = 0;
 static edict_t *activePlayer = nullptr;
+static edict_t *worldEdict = nullptr;
+static int sphereSearchCalls = 0;
+static const char *triggerId = "14";
 static int eventBanners = 0, countdowns = 0, oldSafeMode = 0, fixedVersionHud = 0;
 static int PrecacheSound(char *) { ++soundCalls; return 1; }
 static edict_t *EntityOfIndex(int index) { return index == 1 ? activePlayer : nullptr; }
+static int IndexOfEdict(const edict_t *edict) { return edict == activePlayer ? 1 : 0; }
+static int EntOffsetOfPEntity(const edict_t *edict) { return IndexOfEdict(edict) * (int)sizeof(edict_t); }
+static edict_t *FindEntityInSphere(edict_t *start, const float *, float) {
+    assert(start != worldEdict && "searched past the GoldSrc worldspawn sentinel");
+    ++sphereSearchCalls;
+    return start ? worldEdict : activePlayer;
+}
 static int RegisterUserMsg(const char *name, int) {
     if (!strcmp(name, "SetFOV")) return 1;
     if (!strcmp(name, "ScreenFade")) return 2;
@@ -50,10 +60,10 @@ static void WriteString(const char *s) {
     if (strstr(s, ">>> RANDOM EVENT #")) ++eventBanners;
     if (strstr(s, "NEXT:")) ++countdowns;
     if (strstr(s, "STORY / VEHICLE SAFE MODE")) ++oldSafeMode;
-    if (strstr(s, "HL1 CHAOS v1.1")) ++fixedVersionHud;
+    if (strstr(s, "HL1 CHAOS v1.2")) ++fixedVersionHud;
 }
 static int CmdArgc() { return 2; }
-static const char *CmdArgv(int n) { return n == 0 ? "chaos_trigger" : "14"; }
+static const char *CmdArgv(int n) { return n == 0 ? "chaos_trigger" : triggerId; }
 
 int main(int argc, char **argv) {
     assert(argc == 3);
@@ -74,6 +84,9 @@ int main(int argc, char **argv) {
     enginefuncs_t engine = {};
     engine.pfnPrecacheSound = PrecacheSound;
     engine.pfnPEntityOfEntIndex = EntityOfIndex;
+    engine.pfnEntOffsetOfPEntity = EntOffsetOfPEntity;
+    engine.pfnIndexOfEdict = IndexOfEdict;
+    engine.pfnFindEntityInSphere = FindEntityInSphere;
     engine.pfnRegUserMsg = RegisterUserMsg;
     engine.pfnCVarGetFloat = CVarGetFloat;
     engine.pfnMessageBegin = MessageBegin;
@@ -100,6 +113,7 @@ int main(int argc, char **argv) {
     assert(dll.pfnGameInit && dll.pfnSpawn && dll.pfnSave && dll.pfnGetGameDescription);
     dll.pfnGameInit();
     edict_t world = {};
+    worldEdict = &world;
     world.v.classname = 1;
     assert(dll.pfnSpawn(&world) == 17 && soundCalls == 1);
     dll.pfnSave(&world, nullptr);
@@ -155,8 +169,34 @@ int main(int argc, char **argv) {
     assert(eventBanners == 1 && countdowns > 0 && oldSafeMode == 0 && fixedVersionHud > 0);
     dll.pfnClientCommand(&player); // chaos_trigger 14: real speed effect before HEV
     assert(eventBanners == 2 && player.v.maxspeed == 720);
+
+    // Run the bomb in a fresh session of the actual loaded binary. The fake
+    // engine returns worldspawn at end-of-search, exactly as GoldSrc does;
+    // the old DLL would resume from it and trip the assertion in the mock.
+    dll.pfnServerDeactivate();
+    globals.time = 1;
+    player.v.health = 100;
+    player.v.flags = FL_CLIENT | FL_ONGROUND;
+    player.v.velocity = Vec3(0, 0, 0);
+    dll.pfnServerActivate(&world, 2, 1);
+    dll.pfnClientPutInServer(&player);
+    triggerId = "27";
+    eventBanners = sphereSearchCalls = 0;
+    dll.pfnClientCommand(&player);
+    assert(eventBanners == 1);
+    for (int i = 0; i < 18; ++i) {
+        globals.time += 0.2f;
+        dll.pfnPlayerPreThink(&player);
+        dll.pfnStartFrame();
+        dll.pfnPlayerPostThink(&player);
+    }
+    if (sphereSearchCalls != 2 || player.v.health != 85 || player.v.velocity.z <= 0)
+        fprintf(stderr, "Bomb smoke test: sphere calls=%d, hp=%g, velocity.z=%g\n",
+                sphereSearchCalls, (double)player.v.health, (double)player.v.velocity.z);
+    assert(sphereSearchCalls == 2 && player.v.health == 85 && player.v.velocity.z > 0);
     dll.pfnServerDeactivate();
     activePlayer = nullptr;
+    worldEdict = nullptr;
 
     char originalPath[1024];
     snprintf(originalPath, sizeof(originalPath), "%s", argv[1]);
@@ -182,7 +222,7 @@ int main(int argc, char **argv) {
     if (sizeof(void *) == 4) assert(roundtrip() == 1);
     CloseModule(original);
     CloseModule(proxy);
-    puts(sizeof(void *) == 4 ? "[OK] Shipped x86 proxy forwards, saves, resolves names, and runs intro chaos" :
-                              "[OK] Proxy forwards to the fake original and runs intro chaos");
+    puts(sizeof(void *) == 4 ? "[OK] Shipped x86 proxy forwards, runs intro chaos and detonates bomb" :
+                              "[OK] Proxy forwards, runs intro chaos and detonates bomb");
     return 0;
 }
